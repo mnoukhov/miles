@@ -89,6 +89,7 @@ def _make_args() -> Namespace:
         dynamic_sampling_filter_path=None,
         max_weight_staleness=None,
         megatron_config=encode_megatron_config("solver", "verifier"),
+        never_give_up=0.0,
         reward_key=None,
         rollout_batch_size=1,
     )

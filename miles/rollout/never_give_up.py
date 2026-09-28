@@ -2,21 +2,21 @@
 
 With dynamic sampling, a prompt group with no learning signal (for example all
 rewards equal) is dropped. NGU instead requeues the *same* prompt with probability
-``--never-give-up``. All attempts at one prompt form a *chain*, keyed by the
-``group_index`` of its first attempt; every retry keeps that ``group_index``.
+``--never-give-up``, through the data source's buffer like any other resubmitted
+group. All attempts at one prompt form a *chain* that shares the first attempt's
+``group_index``.
 
-Earlier attempts are buffered on the data source until an attempt is accepted:
+:class:`NeverGiveUpFilter` wraps ``--dynamic-sampling-filter-path``:
 
-- Before any attempt is buffered, the dynamic sampling filter decides as usual.
-- After that, an attempt is accepted only when its max reward is strictly higher
-  than the best reward the chain has seen so far.
+- Before any attempt is buffered, the wrapped filter decides as usual.
+- After that, an attempt is kept only when its max reward is strictly higher than
+  the best reward the chain has seen so far.
 
-On acceptance the buffered attempts (up to ``--ngu-max-pending-age`` steps old)
-are merged with the accepted one into a single group, so the group holds a multiple
-of ``n_samples_per_prompt`` samples. The group's advantage baseline is then the mean
-reward over *every* attempt in the chain, and the max-reward samples are anchored
-while the others are rescaled so the group sums to zero
-(:func:`anchor_positive_advantages`).
+A kept attempt is merged in place with the chain's buffered attempts (up to
+``--ngu-max-pending-age`` weight versions old), so the group holds a multiple of
+``n_samples_per_prompt`` samples. Its advantage baseline is then the mean reward
+over *every* attempt in the chain, and the max-reward samples are anchored while the
+others are rescaled so the group sums to zero (:func:`anchor_positive_advantages`).
 
 A port of allenai/open-instruct#1861.
 """
@@ -25,11 +25,16 @@ import copy
 import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from enum import Enum
+from typing import TYPE_CHECKING
 
 import torch
 
+from miles.rollout.filter_hub.base_types import FilterOutput, call_dynamic_filter
+from miles.rollout.filter_hub.common_filters import group_weight_version_stats
 from miles.utils.types import Sample
+
+if TYPE_CHECKING:  # a runtime import would be circular through miles.rollout.base_types
+    from miles.rollout.data_source import RolloutDataSourceWithBuffer
 
 NGU_BASELINE_REWARD_SUM_KEY = "ngu_baseline_reward_sum"
 NGU_BASELINE_SAMPLE_COUNT_KEY = "ngu_baseline_sample_count"
@@ -37,174 +42,109 @@ NGU_ATTEMPT_COUNT_KEY = "ngu_attempt_count"
 
 
 @dataclass
-class PendingAttempt:
-    # Training step the attempt was generated at: the rollout id, or the weight version under fully async.
-    step: int
-    group: list[Sample]
-
-
-@dataclass
 class PendingChain:
     """Everything buffered for one prompt while NGU keeps retrying it."""
 
-    prompt_template: Sample
     best_reward: float
-    attempts: list[PendingAttempt] = field(default_factory=list)
+    retry_template: Sample
+    # Buffered attempts with the weight version each was generated at.
+    attempts: list[tuple[int | None, list[Sample]]] = field(default_factory=list)
     sample_count: int = 0
     reward_sum: float = 0.0
     attempt_count: int = 0
 
 
-@dataclass
-class NeverGiveUpState:
-    """Pending chains keyed by chain id (the ``group_index`` shared by every attempt)."""
+class NeverGiveUpFilter:
+    """A dynamic sampling filter that retries unsolved prompts instead of dropping them.
 
-    chains: dict[int, PendingChain] = field(default_factory=dict)
+    A kept group is replaced in place by the merged chain, so callers train on whatever
+    ``group`` holds after the call. The pending chains live here, so one instance has to
+    outlive a single rollout.
+    """
+
+    def __init__(self, args, *, dynamic_filter, data_source: "RolloutDataSourceWithBuffer"):
+        self._args = args
+        self._dynamic_filter = dynamic_filter
+        self._data_source = data_source
+        self._rng = random.Random(args.rollout_seed)
+        self._chains: dict[int, PendingChain] = {}
+
+    def __call__(self, args, group: list[Sample], **kwargs) -> FilterOutput:
+        output = call_dynamic_filter(self._dynamic_filter, args, group, **kwargs)
+        chain_id = group[0].group_index
+        rewards = [sample.get_reward_value(args) for sample in group]
+        pending = self._chains.pop(chain_id, None)
+
+        if _should_accept(
+            rewards, filter_keep=output.keep, best_reward=None if pending is None else pending.best_reward
+        ):
+            group[:] = self._merge_chain(pending, group=group, rewards=rewards)
+            return FilterOutput(keep=True)
+
+        best_reward = max(rewards) if pending is None else max(pending.best_reward, *rewards)
+        if best_reward >= self._args.ngu_solved_reward or self._rng.random() >= self._args.never_give_up:
+            return FilterOutput(keep=False, reason=output.reason or "never_give_up_not_improved")
+
+        pending = pending or PendingChain(best_reward=best_reward, retry_template=group[0])
+        pending.best_reward = best_reward
+        if self._args.ngu_keep_pending_completions:
+            pending.attempts.append((_weight_version(group), group))
+        pending.sample_count += len(group)
+        pending.reward_sum += sum(rewards)
+        pending.attempt_count += 1
+        self._chains[chain_id] = pending
+        self._requeue(pending.retry_template)
+        return FilterOutput(keep=False, reason="never_give_up_requeued")
+
+    def requeue_lost_retries(self) -> None:
+        """Requeue chains whose retry is neither buffered nor generating, e.g. because it was
+        aborted when a rollout ended or failed a filter before reaching NGU."""
+        buffered = {group[0].group_index for group in self._data_source.buffer}
+        for chain_id, pending in self._chains.items():
+            if chain_id not in buffered:
+                self._requeue(pending.retry_template)
+
+    def _requeue(self, retry_template: Sample) -> None:
+        sample_indices = self._data_source.reserve_sample_indices(self._args.n_samples_per_prompt)
+        self._data_source.add_samples([make_retry_group(retry_template, sample_indices=sample_indices)])
+
+    def _merge_chain(self, pending: PendingChain | None, *, group: list[Sample], rewards: list[float]) -> list[Sample]:
+        """The chain's fresh-enough buffered attempts plus the kept one, each sample carrying the
+        chain-wide baseline."""
+        if pending is None:
+            pending = PendingChain(best_reward=max(rewards), retry_template=group[0])
+        version = _weight_version(group)
+        max_age = self._args.ngu_max_pending_age
+        merged = [
+            sample
+            for attempt_version, attempt in pending.attempts
+            if max_age < 0 or version is None or attempt_version is None or version - attempt_version <= max_age
+            for sample in attempt
+        ]
+        merged.extend(group)
+        for sample in merged:
+            sample.group_index = group[0].group_index
+            sample.metadata[NGU_BASELINE_REWARD_SUM_KEY] = pending.reward_sum + sum(rewards)
+            sample.metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] = pending.sample_count + len(group)
+            sample.metadata[NGU_ATTEMPT_COUNT_KEY] = pending.attempt_count + 1
+        return merged
 
 
-@dataclass(frozen=True)
-class NeverGiveUpConfig:
-    probability: float
-    max_pending_age: int
-    keep_pending_completions: bool
-    solved_reward: float
-
-    @classmethod
-    def from_args(cls, args) -> "NeverGiveUpConfig":
-        return cls(
-            probability=args.never_give_up,
-            max_pending_age=args.ngu_max_pending_age,
-            keep_pending_completions=args.ngu_keep_pending_completions,
-            solved_reward=args.ngu_solved_reward,
-        )
-
-
-class NeverGiveUpAction(Enum):
-    KEEP = "keep"
-    DROP = "drop"
-    REQUEUE = "requeue"
-
-
-@dataclass(frozen=True)
-class NeverGiveUpDecision:
-    action: NeverGiveUpAction
-    # The (possibly merged) group to train on, set only for KEEP.
-    group: list[Sample] | None = None
-    # Earlier attempts flushed along with a DROP, for bookkeeping.
-    dropped_attempts: list[list[Sample]] = field(default_factory=list)
-
-
-def chain_id_of(group: list[Sample]) -> int:
-    chain_id = group[0].group_index
-    assert chain_id is not None, "never_give_up needs every sample to carry a group_index"
-    return chain_id
-
-
-def should_accept_attempt(rewards: list[float], filter_keep: bool, best_reward: float | None) -> bool:
-    """Accept the first attempt when the dynamic filter keeps it; later attempts only when they
-    strictly beat the chain's best reward so far."""
+def _should_accept(rewards: list[float], *, filter_keep: bool, best_reward: float | None) -> bool:
     if best_reward is None:
         return filter_keep
     return max(rewards) > best_reward
 
 
-def decide_never_give_up(
-    *,
-    config: NeverGiveUpConfig,
-    state: NeverGiveUpState,
-    group: list[Sample],
-    rewards: list[float],
-    filter_keep: bool,
-    prompt_template: Sample,
-    step: int,
-    rng: random.Random,
-) -> NeverGiveUpDecision:
-    """Keep, drop or requeue a finished group, updating ``state`` in place.
-
-    ``prompt_template`` is the group's prompt before generation; a REQUEUE stores it
-    on the chain so the caller can build the retry with :func:`make_retry_group`.
-    """
-    chain_id = chain_id_of(group)
-    pending = state.chains.pop(chain_id, None)
-    best_reward = None if pending is None else pending.best_reward
-
-    if should_accept_attempt(rewards, filter_keep=filter_keep, best_reward=best_reward):
-        return NeverGiveUpDecision(
-            action=NeverGiveUpAction.KEEP,
-            group=_merge_chain(config, pending, group=group, rewards=rewards, step=step),
-        )
-
-    best_reward = max(rewards) if best_reward is None else max(best_reward, max(rewards))
-    if best_reward >= config.solved_reward or rng.random() >= config.probability:
-        dropped = [] if pending is None else [attempt.group for attempt in pending.attempts]
-        return NeverGiveUpDecision(action=NeverGiveUpAction.DROP, dropped_attempts=dropped)
-
-    if pending is None:
-        pending = PendingChain(prompt_template=prompt_template, best_reward=best_reward)
-    pending.best_reward = best_reward
-    if config.keep_pending_completions:
-        pending.attempts.append(PendingAttempt(step=step, group=group))
-    pending.sample_count += len(group)
-    pending.reward_sum += sum(rewards)
-    pending.attempt_count += 1
-    state.chains[chain_id] = pending
-    return NeverGiveUpDecision(action=NeverGiveUpAction.REQUEUE)
+def _weight_version(group: list[Sample]) -> int | None:
+    return group_weight_version_stats(group).newest_version
 
 
-def _merge_chain(
-    config: NeverGiveUpConfig,
-    pending: PendingChain | None,
-    *,
-    group: list[Sample],
-    rewards: list[float],
-    step: int,
-) -> list[Sample]:
-    """Merge the chain's fresh-enough buffered attempts into the accepted group and record the
-    chain-wide baseline on every sample."""
-    attempts = [] if pending is None else pending.attempts
-    merged = [
-        sample
-        for attempt in attempts
-        if config.max_pending_age < 0 or step - attempt.step <= config.max_pending_age
-        for sample in attempt.group
-    ]
-    merged.extend(group)
-
-    chain_id = chain_id_of(group)
-    baseline_reward_sum = sum(rewards) + (0.0 if pending is None else pending.reward_sum)
-    baseline_sample_count = len(group) + (0 if pending is None else pending.sample_count)
-    attempt_count = 1 + (0 if pending is None else pending.attempt_count)
-    for sample in merged:
-        sample.group_index = chain_id
-        sample.metadata[NGU_BASELINE_REWARD_SUM_KEY] = baseline_reward_sum
-        sample.metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] = baseline_sample_count
-        sample.metadata[NGU_ATTEMPT_COUNT_KEY] = attempt_count
-    return merged
-
-
-def prune_stale_attempts(
-    group: list[Sample], *, attempt_size: int, is_stale: Callable[[list[Sample]], bool]
-) -> list[Sample]:
-    """Drop the buffered attempts of a merged group that became too stale while it waited to be
-    trained on. The accepted attempt (the last one) is always kept, and the chain-wide baseline
-    recorded on the samples still counts the dropped attempts' rewards."""
-    assert len(group) % attempt_size == 0, f"a merged group of {len(group)} samples is not whole attempts"
-    attempts = [group[start : start + attempt_size] for start in range(0, len(group), attempt_size)]
-    kept = [attempt for attempt in attempts[:-1] if not is_stale(attempt)]
-    return [sample for attempt in [*kept, attempts[-1]] for sample in attempt]
-
-
-def make_prompt_template(sample: Sample) -> Sample:
-    """Snapshot a not-yet-generated sample so it can be re-sampled later."""
-    return copy.deepcopy(sample)
-
-
-def make_retry_group(prompt_template: Sample, *, sample_indices: list[int]) -> list[Sample]:
-    """Fresh copies of the chain's prompt, one per new sample index. They keep the template's
-    ``group_index`` so the retry stays on the same chain."""
+def make_retry_group(retry_template: Sample, *, sample_indices: list[int]) -> list[Sample]:
+    """Fresh copies of a chain's prompt. They keep its ``group_index`` so the retry stays on the chain."""
     group = []
     for index in sample_indices:
-        sample = copy.deepcopy(prompt_template)
+        sample = copy.deepcopy(retry_template)
         sample.reset_for_retry()
         sample.status = Sample.Status.PENDING
         sample.index = index
@@ -212,8 +152,21 @@ def make_retry_group(prompt_template: Sample, *, sample_indices: list[int]) -> l
     return group
 
 
+def prune_stale_attempts(
+    group: list[Sample], *, attempt_size: int, is_stale: Callable[[list[Sample]], bool]
+) -> list[Sample]:
+    """Drop the buffered attempts of a merged group that became too stale while it waited to be
+    trained on. The kept attempt (the last one) always stays, and the chain-wide baseline on the
+    samples still counts the dropped attempts' rewards."""
+    if len(group) == attempt_size:
+        return group
+    attempts = [group[start : start + attempt_size] for start in range(0, len(group), attempt_size)]
+    kept = [attempt for attempt in attempts[:-1] if not is_stale(attempt)]
+    return [sample for attempt in [*kept, attempts[-1]] for sample in attempt]
+
+
 def ngu_baseline_mean(samples: list[Sample]) -> float | None:
-    """The chain-wide mean reward recorded by :func:`decide_never_give_up`, if any."""
+    """The chain-wide mean reward NGU recorded on a group, if any."""
     metadata = samples[0].metadata
     if NGU_BASELINE_SAMPLE_COUNT_KEY not in metadata:
         return None

@@ -8,19 +8,11 @@ from packaging.version import parse
 from tqdm import tqdm
 
 from miles.rollout.base_types import RolloutFnTrainOutput
-from miles.rollout.data_source import RolloutDataSourceWithBuffer
-from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
-from miles.rollout.filter_hub.common_filters import apply_invalid_group_filters, apply_preput_filters
+from miles.rollout.filter_hub.base_types import MetricGatherer
+from miles.rollout.filter_hub.common_filters import apply_preput_filters
 from miles.rollout.generate_utils.prefill_logprobs import recompute_samples_rollout_logprobs_via_prefill
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
-from miles.rollout.never_give_up import (
-    NeverGiveUpAction,
-    NeverGiveUpConfig,
-    chain_id_of,
-    decide_never_give_up,
-    make_prompt_template,
-)
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils import dumper_utils
 from miles.utils.function_registry import load_function
@@ -102,16 +94,15 @@ async def generate_rollout_async(
     state: GenerateState,
     rollout_id: int,
     data_source: Callable[[int], list[list[Sample]]],
-    never_give_up_source: RolloutDataSourceWithBuffer | None = None,
+    dynamic_filter: Callable | None = None,
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
-    """``never_give_up_source`` turns on never_give_up: it holds the retry chains and requeues prompts."""
     args = state.args
     assert args.rollout_global_dataset
 
     await dumper_utils.configure_sglang(args)
 
     # instantiate data filters
-    dynamic_filter = load_function(args.dynamic_sampling_filter_path)
+    dynamic_filter = dynamic_filter or load_function(args.dynamic_sampling_filter_path)
 
     metric_gatherer = MetricGatherer()
 
@@ -121,8 +112,6 @@ async def generate_rollout_async(
     # default to group level submission for sync/one-step async rollout
     scheduler = make_submission_scheduler(args, default="group")
 
-    # Prompts of submitted groups, kept so never_give_up can requeue them after generation.
-    prompt_templates: dict[int, Sample] = {}
     pendings = set()
     data = []
     all_data = []
@@ -132,8 +121,6 @@ async def generate_rollout_async(
         while scheduler.has_capacity(pending_groups=len(pendings), group_budget=target_data_size - len(data)):
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
-            if never_give_up_source is not None:
-                prompt_templates.update({chain_id_of(group): make_prompt_template(group[0]) for group in samples})
             scheduler.on_submit(samples)
             pendings.update(submit_generate_tasks(state, samples, scheduler.sample_done_callback))
 
@@ -161,23 +148,10 @@ async def generate_rollout_async(
             assert len(group) == args.n_samples_per_prompt
             all_data.append(group)
             metric_gatherer.on_group_before_dynamic_filter(args, group)
-            if never_give_up_source is None:
-                filter_output = apply_preput_filters(args, dynamic_filter, group)
-                if not filter_output.keep:
-                    metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
-                    continue
-            else:
-                group = _filter_group_with_never_give_up(
-                    args,
-                    dynamic_filter=dynamic_filter,
-                    never_give_up_source=never_give_up_source,
-                    group=group,
-                    prompt_template=prompt_templates.pop(chain_id_of(group)),
-                    rollout_id=rollout_id,
-                    metric_gatherer=metric_gatherer,
-                )
-                if group is None:
-                    continue
+            filter_output = apply_preput_filters(args, dynamic_filter, group)
+            if not filter_output.keep:
+                metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
+                continue
 
             # add the samples to the data
             # NOTE: here we have not stored all the unused samples back to the data buffer.
@@ -196,8 +170,6 @@ async def generate_rollout_async(
 
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(state, pendings, rollout_id)
-    if never_give_up_source is not None:
-        _requeue_unfinished_retries(never_give_up_source, prompt_templates)
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
@@ -222,54 +194,3 @@ async def generate_rollout_async(
     )
 
     return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
-
-
-def _filter_group_with_never_give_up(
-    args: Namespace,
-    *,
-    dynamic_filter,
-    never_give_up_source: RolloutDataSourceWithBuffer,
-    group: list[Sample],
-    prompt_template: Sample,
-    rollout_id: int,
-    metric_gatherer: MetricGatherer,
-) -> list[Sample] | None:
-    """Return the group to train on (merged with earlier attempts of its prompt), or None when it is
-    dropped or requeued for another attempt."""
-    chain_state = never_give_up_source.never_give_up_state
-    invalid_output = apply_invalid_group_filters(args, group)
-    if not invalid_output.keep:
-        # An unusable attempt ends its chain: nothing requeues it any more.
-        chain_state.chains.pop(chain_id_of(group), None)
-        metric_gatherer.on_dynamic_filter_drop(reason=invalid_output.reason)
-        return None
-
-    filter_output = call_dynamic_filter(dynamic_filter, args, group)
-    decision = decide_never_give_up(
-        config=NeverGiveUpConfig.from_args(args),
-        state=chain_state,
-        group=group,
-        rewards=[sample.get_reward_value(args) for sample in group],
-        filter_keep=filter_output.keep,
-        prompt_template=prompt_template,
-        step=rollout_id,
-        rng=never_give_up_source.never_give_up_rng,
-    )
-    metric_gatherer.on_never_give_up_decision(decision)
-    if decision.action == NeverGiveUpAction.REQUEUE:
-        never_give_up_source.requeue_prompt(prompt_template)
-        return None
-    if decision.action == NeverGiveUpAction.DROP:
-        metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason or "never_give_up_not_improved")
-        return None
-    return decision.group
-
-
-def _requeue_unfinished_retries(
-    never_give_up_source: RolloutDataSourceWithBuffer, prompt_templates: dict[int, Sample]
-) -> None:
-    """Retries still generating when the rollout ends are aborted; requeue them so their chains
-    are not left waiting for an attempt that never comes back."""
-    for chain_id, prompt_template in prompt_templates.items():
-        if chain_id in never_give_up_source.never_give_up_state.chains:
-            never_give_up_source.requeue_prompt(prompt_template)

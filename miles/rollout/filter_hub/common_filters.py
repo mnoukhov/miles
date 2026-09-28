@@ -68,20 +68,15 @@ def group_weight_version_stats(group: Group) -> GroupWeightVersionStats:
 
 
 def apply_preput_filters(args: Namespace, dynamic_filter, samples: Group, **kwargs) -> FilterOutput:
-    output = apply_invalid_group_filters(args, samples, **kwargs)
-    if not output.keep:
-        return output
-
-    return call_dynamic_filter(dynamic_filter, args, samples, **kwargs)
-
-
-def apply_invalid_group_filters(args: Namespace, samples: Group, **kwargs) -> FilterOutput:
-    """Filters for groups that cannot be trained on at all, as opposed to the dynamic sampling filter."""
     output = apply_aborted_filter(args, samples, **kwargs)
     if not output.keep:
         return output
 
-    return apply_missing_reward_filter(args, samples, **kwargs)
+    output = apply_missing_reward_filter(args, samples, **kwargs)
+    if not output.keep:
+        return output
+
+    return call_dynamic_filter(dynamic_filter, args, samples, **kwargs)
 
 
 def apply_aborted_filter(args: Namespace, samples: Group, **kwargs) -> FilterOutput:
