@@ -13,7 +13,7 @@ group. All attempts at one prompt form a *chain* that shares the first attempt's
   the best reward the chain has seen so far.
 
 A kept attempt is merged in place with the chain's buffered attempts (up to
-``--ngu-max-pending-age`` weight versions old), so the group holds a multiple of
+``--max-weight-staleness`` weight versions old), so the group holds a multiple of
 ``n_samples_per_prompt`` samples. Its advantage baseline is then the mean reward
 over *every* attempt in the chain, and the max-reward samples are anchored while the
 others are rescaled so the group sums to zero (:func:`anchor_positive_advantages`).
@@ -87,8 +87,7 @@ class NeverGiveUpFilter:
 
         pending = pending or PendingChain(best_reward=best_reward, retry_template=group[0])
         pending.best_reward = best_reward
-        if self._args.ngu_keep_pending_completions:
-            pending.attempts.append((_weight_version(group), group))
+        pending.attempts.append((_weight_version(group), group))
         pending.sample_count += len(group)
         pending.reward_sum += sum(rewards)
         pending.attempt_count += 1
@@ -114,11 +113,14 @@ class NeverGiveUpFilter:
         if pending is None:
             pending = PendingChain(best_reward=max(rewards), retry_template=group[0])
         version = _weight_version(group)
-        max_age = self._args.ngu_max_pending_age
+        max_staleness = self._args.max_weight_staleness
         merged = [
             sample
             for attempt_version, attempt in pending.attempts
-            if max_age < 0 or version is None or attempt_version is None or version - attempt_version <= max_age
+            if max_staleness is None
+            or version is None
+            or attempt_version is None
+            or version - attempt_version <= max_staleness
             for sample in attempt
         ]
         merged.extend(group)

@@ -36,8 +36,6 @@ def _args(**overrides) -> Namespace:
         reward_key=None,
         dynamic_sampling_filter_path=f"{__name__}.nonzero_std",
         never_give_up=1.0,
-        ngu_max_pending_age=4,
-        ngu_keep_pending_completions=True,
         ngu_solved_reward=1.0,
         async_data_buffer_capacity_factor=1000.0,
         max_weight_staleness=None,
@@ -141,21 +139,12 @@ class TestNeverGiveUpFilter:
         assert len(source.buffer) == 1
 
     def test_stale_attempts_leave_the_merge_but_stay_in_the_baseline(self):
-        ngu, source = _make_filter(ngu_max_pending_age=2)
+        ngu, source = _make_filter(max_weight_staleness=2)
         ngu(ngu._args, _group(7, [0.0] * GROUP_SIZE, first_index=100, version=0))
         retry = _answer(source.get_samples(1)[0], [0.0, 1.0, 0.0, 0.0], version=5)
 
         assert ngu(ngu._args, retry).keep
         assert [sample.index for sample in retry] == [0, 1, 2, 3]
-        assert retry[0].metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] == 2 * GROUP_SIZE
-
-    def test_without_pending_completions_only_the_rewards_are_kept(self):
-        ngu, source = _make_filter(ngu_keep_pending_completions=False)
-        ngu(ngu._args, _group(7, [0.0] * GROUP_SIZE, first_index=100))
-        retry = _answer(source.get_samples(1)[0], [1.0, 0.0, 0.0, 0.0])
-
-        assert ngu(ngu._args, retry).keep
-        assert len(retry) == GROUP_SIZE
         assert retry[0].metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] == 2 * GROUP_SIZE
 
     def test_lost_retries_are_requeued(self):

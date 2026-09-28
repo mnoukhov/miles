@@ -277,9 +277,9 @@ def _normalize_rewards_by_rollout(
 
 
 def _never_give_up_baseline(args: Any, group_samples: list[Sample]) -> float | None:
-    """The chain-wide mean reward of a never_give_up group. Keeping every pending attempt
-    (--ngu-max-pending-age -1) makes it the plain group mean, so it is not used then."""
-    if getattr(args, "never_give_up", 0) <= 0 or args.ngu_max_pending_age < 0:
+    """The chain-wide mean reward of a never_give_up group. It equals the plain group mean when
+    no pending attempt was dropped for staleness."""
+    if getattr(args, "never_give_up", 0) <= 0:
         return None
     return ngu_baseline_mean(group_samples)
 

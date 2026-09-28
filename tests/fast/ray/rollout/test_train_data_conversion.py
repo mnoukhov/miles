@@ -362,7 +362,6 @@ class TestPostProcessRewards:
             rewards_normalization=True,
             grpo_std_normalization=False,
             never_give_up=1.0,
-            ngu_max_pending_age=4,
         )
         samples = make_samples_grouped(1, 4, rewards=[0.0, 0.0, 0.0, 1.0])
         for sample in samples:
@@ -374,17 +373,16 @@ class TestPostProcessRewards:
         assert sum(processed) == pytest.approx(0.0, abs=1e-6)
         assert processed[0] == pytest.approx(processed[1])
 
-    def test_never_give_up_baseline_is_ignored_when_every_attempt_is_kept(self):
+    def test_never_give_up_group_with_no_dropped_attempt_matches_the_plain_group_advantage(self):
         args = make_args(
             advantage_estimator="grpo",
             rewards_normalization=True,
             grpo_std_normalization=False,
             never_give_up=1.0,
-            ngu_max_pending_age=-1,
         )
         samples = make_samples_grouped(1, 4, rewards=[0.0, 0.0, 0.0, 1.0])
         for sample in samples:
-            sample.metadata.update(ngu_baseline_reward_sum=1.0, ngu_baseline_sample_count=12)
+            sample.metadata.update(ngu_baseline_reward_sum=1.0, ngu_baseline_sample_count=4)
         _, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
 
         assert processed == pytest.approx([-0.25, -0.25, -0.25, 0.75])

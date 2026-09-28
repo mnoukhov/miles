@@ -281,8 +281,6 @@ Sections mirror the launch-script argument groups.
 | `--custom-rm-path` | str | – | Custom reward function (see [Customization](/user-guide/customization)). |
 | `--dynamic-sampling-filter-path` | str | – | Group filter (DAPO-style). |
 | `--never-give-up` | float | 0.0 | Never Give Up: probability of requeuing an unsolved group the dynamic filter rejects instead of dropping it. Requires `--use-dynamic-global-batch-size`. |
-| `--ngu-max-pending-age` | int | 4 | Max age, in rollouts, of buffered NGU attempts that train with the accepted one; `-1` keeps all. |
-| `--[no-]ngu-keep-pending-completions` | flag | on | Train on buffered NGU attempts, not only count them in the baseline. |
 | `--ngu-solved-reward` | float | 1.0 | Reward at which NGU treats a prompt as solved and stops retrying it. |
 | `--rollout-submission-granularity` | enum | driver | `group` or `sample`: what frees rollout submission capacity. Unset means `sample` under `--fully-async`, `group` otherwise. |
 | `--buffer-filter-path` | str | – | Buffer dequeue filter. |

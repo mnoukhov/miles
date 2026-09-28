@@ -845,24 +845,6 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
-                "--ngu-max-pending-age",
-                type=int,
-                default=4,
-                help=(
-                    "Max age, in rollouts, of buffered NGU attempts that train alongside the accepted one. "
-                    "Older attempts still count toward the baseline. -1 keeps every attempt, which makes "
-                    "the baseline the plain group mean."
-                ),
-            )
-            parser.add_argument(
-                "--ngu-keep-pending-completions",
-                action=argparse.BooleanOptionalAction,
-                default=True,
-                help=(
-                    "Train on the buffered NGU attempts' completions, not only count their rewards in the " "baseline."
-                ),
-            )
-            parser.add_argument(
                 "--ngu-solved-reward",
                 type=float,
                 default=1.0,
@@ -913,7 +895,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Maximum allowed gap between a group's oldest weight version and the current "
                     "engine weight version. Groups exceeding this threshold are recycled back to "
                     "the data buffer instead of being sent to training. Only effective in fully "
-                    "async mode. None (default) disables staleness filtering."
+                    "async mode, except that --never-give-up also uses it to drop buffered attempts that "
+                    "are too old to train alongside the accepted one. None (default) disables staleness "
+                    "filtering."
                 ),
             )
             parser.add_argument(
