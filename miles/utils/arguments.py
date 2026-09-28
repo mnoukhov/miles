@@ -76,8 +76,13 @@ def _validate_never_give_up_args(args) -> None:
         not use_legacy_rollout_v1()
     ), "--never-give-up needs the class-based rollout; unset MILES_USE_LEGACY_ROLLOUT_V1"
     assert (
-        args.rollout_function_path is None and not args.fully_async
-    ), "--never-give-up is implemented in the default rollout function only"
+        args.rollout_function_path is None
+    ), "--never-give-up is implemented in the default and --fully-async rollout functions only"
+    if args.fully_async:
+        assert (
+            args.custom_async_data_buffer_path is None
+            and getattr(args, "custom_async_data_buffer_path_per_model", None) is None
+        ), "--never-give-up runs in the default fully-async data buffer; drop --custom-async-data-buffer-path"
     assert not args.partial_rollout, "--never-give-up does not support --partial-rollout"
     # Merged groups make the sample count vary, and trimming it to --global-batch-size could split one.
     assert args.use_dynamic_global_batch_size, "--never-give-up requires --use-dynamic-global-batch-size"

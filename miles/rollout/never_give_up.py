@@ -11,7 +11,7 @@ Earlier attempts are buffered on the data source until an attempt is accepted:
 - After that, an attempt is accepted only when its max reward is strictly higher
   than the best reward the chain has seen so far.
 
-On acceptance the buffered attempts (up to ``--ngu-max-pending-age`` rollouts old)
+On acceptance the buffered attempts (up to ``--ngu-max-pending-age`` steps old)
 are merged with the accepted one into a single group, so the group holds a multiple
 of ``n_samples_per_prompt`` samples. The group's advantage baseline is then the mean
 reward over *every* attempt in the chain, and the max-reward samples are anchored
@@ -23,6 +23,7 @@ A port of allenai/open-instruct#1861.
 
 import copy
 import random
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -37,7 +38,8 @@ NGU_ATTEMPT_COUNT_KEY = "ngu_attempt_count"
 
 @dataclass
 class PendingAttempt:
-    rollout_id: int
+    # Training step the attempt was generated at: the rollout id, or the weight version under fully async.
+    step: int
     group: list[Sample]
 
 
@@ -114,7 +116,7 @@ def decide_never_give_up(
     rewards: list[float],
     filter_keep: bool,
     prompt_template: Sample,
-    rollout_id: int,
+    step: int,
     rng: random.Random,
 ) -> NeverGiveUpDecision:
     """Keep, drop or requeue a finished group, updating ``state`` in place.
@@ -129,7 +131,7 @@ def decide_never_give_up(
     if should_accept_attempt(rewards, filter_keep=filter_keep, best_reward=best_reward):
         return NeverGiveUpDecision(
             action=NeverGiveUpAction.KEEP,
-            group=_merge_chain(config, pending, group=group, rewards=rewards, rollout_id=rollout_id),
+            group=_merge_chain(config, pending, group=group, rewards=rewards, step=step),
         )
 
     best_reward = max(rewards) if best_reward is None else max(best_reward, max(rewards))
@@ -141,7 +143,7 @@ def decide_never_give_up(
         pending = PendingChain(prompt_template=prompt_template, best_reward=best_reward)
     pending.best_reward = best_reward
     if config.keep_pending_completions:
-        pending.attempts.append(PendingAttempt(rollout_id=rollout_id, group=group))
+        pending.attempts.append(PendingAttempt(step=step, group=group))
     pending.sample_count += len(group)
     pending.reward_sum += sum(rewards)
     pending.attempt_count += 1
@@ -155,7 +157,7 @@ def _merge_chain(
     *,
     group: list[Sample],
     rewards: list[float],
-    rollout_id: int,
+    step: int,
 ) -> list[Sample]:
     """Merge the chain's fresh-enough buffered attempts into the accepted group and record the
     chain-wide baseline on every sample."""
@@ -163,7 +165,7 @@ def _merge_chain(
     merged = [
         sample
         for attempt in attempts
-        if config.max_pending_age < 0 or rollout_id - attempt.rollout_id <= config.max_pending_age
+        if config.max_pending_age < 0 or step - attempt.step <= config.max_pending_age
         for sample in attempt.group
     ]
     merged.extend(group)
@@ -178,6 +180,18 @@ def _merge_chain(
         sample.metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] = baseline_sample_count
         sample.metadata[NGU_ATTEMPT_COUNT_KEY] = attempt_count
     return merged
+
+
+def prune_stale_attempts(
+    group: list[Sample], *, attempt_size: int, is_stale: Callable[[list[Sample]], bool]
+) -> list[Sample]:
+    """Drop the buffered attempts of a merged group that became too stale while it waited to be
+    trained on. The accepted attempt (the last one) is always kept, and the chain-wide baseline
+    recorded on the samples still counts the dropped attempts' rewards."""
+    assert len(group) % attempt_size == 0, f"a merged group of {len(group)} samples is not whole attempts"
+    attempts = [group[start : start + attempt_size] for start in range(0, len(group), attempt_size)]
+    kept = [attempt for attempt in attempts[:-1] if not is_stale(attempt)]
+    return [sample for attempt in [*kept, attempts[-1]] for sample in attempt]
 
 
 def make_prompt_template(sample: Sample) -> Sample:

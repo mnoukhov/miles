@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
+from miles.rollout.data_source import RolloutDataSourceWithBuffer
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, iter_samples
 from miles.rollout.filter_hub.common_filters import (
     GroupWeightVersionStats,
@@ -22,6 +23,13 @@ from miles.rollout.filter_hub.common_filters import (
     apply_missing_reward_filter,
     group_staleness,
     group_weight_version_stats,
+)
+from miles.rollout.never_give_up import (
+    NGU_ATTEMPT_COUNT_KEY,
+    NeverGiveUpAction,
+    NeverGiveUpConfig,
+    decide_never_give_up,
+    prune_stale_attempts,
 )
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
@@ -66,6 +74,8 @@ def first_sample(group: Group) -> Sample:
 class DataBufferConstructorInput:
     args: Namespace
     unused_handler_fn: Callable[[list[Sample]], None]  # --async-unused-samples-handler, applied to unused groups
+    # --never-give-up: the data source holding the retry chains, which requeues prompts
+    never_give_up_source: RolloutDataSourceWithBuffer | None = None
 
 
 @dataclass
@@ -138,6 +148,7 @@ class DefaultDataBuffer(DataBuffer):
 
         self._unused_handler_fn = input.unused_handler_fn
         self._dynamic_filter = load_function(args.dynamic_sampling_filter_path)
+        self._never_give_up_source = input.never_give_up_source
         self._cond = asyncio.Condition()
         self._current_version: int | None = None
 
@@ -171,14 +182,45 @@ class DefaultDataBuffer(DataBuffer):
 
         output = apply_missing_reward_filter(self._args, input.group)
         if not output.keep:
+            if self._never_give_up_source is not None:
+                # An unusable attempt ends its chain: nothing requeues it any more.
+                self._never_give_up_source.never_give_up_state.chains.pop(first_sample(input.group).group_index, None)
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
             return False
 
         self._metric_gatherer.on_group_before_dynamic_filter(self._args, input.group)
         output = call_dynamic_filter(self._dynamic_filter, self._args, input.group)
+        if self._never_give_up_source is not None:
+            return self._never_give_up_filter(input, filter_keep=output.keep, filter_reason=output.reason)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
             return False
+        return True
+
+    def _never_give_up_filter(self, input: DataBufferInput, *, filter_keep: bool, filter_reason: str | None) -> bool:
+        """Keep (merged with the earlier attempts of its prompt), drop, or requeue a finished group.
+        A kept group replaces ``input.group`` with the merged one."""
+        source = self._never_give_up_source
+        assert all(isinstance(sample, Sample) for sample in input.group), "--never-give-up needs flat groups"
+        decision = decide_never_give_up(
+            config=NeverGiveUpConfig.from_args(self._args),
+            state=source.never_give_up_state,
+            group=input.group,
+            rewards=[sample.get_reward_value(self._args) for sample in input.group],
+            filter_keep=filter_keep,
+            prompt_template=input.prompt_group[0],
+            # Age pending attempts by the weight version training last asked for.
+            step=self._current_version or 0,
+            rng=source.never_give_up_rng,
+        )
+        self._metric_gatherer.on_never_give_up_decision(decision)
+        if decision.action == NeverGiveUpAction.REQUEUE:
+            source.requeue_prompt(input.prompt_group[0])
+            return False
+        if decision.action == NeverGiveUpAction.DROP:
+            self._metric_gatherer.on_dynamic_filter_drop(reason=filter_reason or "never_give_up_not_improved")
+            return False
+        input.group = decision.group
         return True
 
     async def get(self, current_version: int | None = None, **_) -> DataBufferInput:
@@ -190,6 +232,7 @@ class DefaultDataBuffer(DataBuffer):
                     await self._cond.wait()
                 entry = self._buffer.pop(0)
                 self._cond.notify_all()  # wake producers blocked on a full buffer
+                self._maybe_prune_never_give_up_attempts(entry, current_version)
 
                 version_stats = group_weight_version_stats(entry.group)
                 staleness = version_stats.oldest_lag(current_version)
@@ -202,6 +245,23 @@ class DefaultDataBuffer(DataBuffer):
                     self._metric_consumed_staleness.append(staleness)
                 self._record_selected_version_stats(version_stats, current_version)
                 return entry
+
+    def _maybe_prune_never_give_up_attempts(self, entry: DataBufferInput, current_version: int | None) -> None:
+        """A merged never_give_up group carries older attempts, so judge staleness on the accepted
+        attempt alone: drop the buffered attempts that are now too stale and keep the rest."""
+        max_staleness = self._args.max_weight_staleness
+        if self._never_give_up_source is None or max_staleness is None or current_version is None:
+            return
+        if first_sample(entry.group).metadata.get(NGU_ATTEMPT_COUNT_KEY, 1) <= 1:
+            return
+
+        def is_stale(attempt: list[Sample]) -> bool:
+            staleness = group_staleness(attempt, current_version)
+            return staleness is not None and staleness > max_staleness
+
+        entry.group = prune_stale_attempts(
+            entry.group, attempt_size=self._args.n_samples_per_prompt, is_stale=is_stale
+        )
 
     def _record_selected_version_stats(
         self,

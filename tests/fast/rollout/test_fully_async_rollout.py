@@ -96,6 +96,7 @@ def make_args(**overrides) -> Namespace:
         sglang_router_port=30000,
         sglang_router_request_timeout_secs=14400,
         eval_num_gpus=0,
+        never_give_up=0.0,
     )
     defaults.update(overrides)
     return Namespace(**defaults)

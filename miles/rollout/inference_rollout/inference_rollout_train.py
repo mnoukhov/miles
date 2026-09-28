@@ -252,7 +252,7 @@ def _filter_group_with_never_give_up(
         rewards=[sample.get_reward_value(args) for sample in group],
         filter_keep=filter_output.keep,
         prompt_template=prompt_template,
-        rollout_id=rollout_id,
+        step=rollout_id,
         rng=never_give_up_source.never_give_up_rng,
     )
     metric_gatherer.on_never_give_up_decision(decision)

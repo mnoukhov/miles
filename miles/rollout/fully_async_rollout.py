@@ -82,6 +82,14 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._producer_resumed = asyncio.Event()
         self._producer_resumed.set()
         self._output: DataBuffer | None = None
+        # never_give_up keeps its retry chains on the data source and requeues prompts through it.
+        self._never_give_up_source = self.data_source if input.args.never_give_up > 0 else None
+        if self._never_give_up_source is not None:
+            assert not resolve_megatron_config(input.args).is_multi_policy, "--never-give-up trains a single policy"
+            assert hasattr(self.data_source, "requeue_prompt"), (
+                "--never-give-up requeues prompts through the data source; "
+                "use a --data-source-path like RolloutDataSourceWithBuffer that has requeue_prompt"
+            )
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
@@ -92,7 +100,11 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             )
             buffer_cls = load_function(self.args.custom_async_data_buffer_path) or default_buffer_cls
             self._output = buffer_cls(
-                DataBufferConstructorInput(args=self.args, unused_handler_fn=self._handle_unused)
+                DataBufferConstructorInput(
+                    args=self.args,
+                    unused_handler_fn=self._handle_unused,
+                    never_give_up_source=self._never_give_up_source,
+                )
             )
             self._worker = asyncio.create_task(self._worker_loop())
             logger.info("Started fully-async rollout worker")
@@ -205,7 +217,8 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             entry = await self._next_group(
                 current_version=input.weight_version, trainer_model_id=input.trainer_model_id
             )
-            assert len(entry.group) == args.n_samples_per_prompt
+            # A never_give_up group merges several attempts at its prompt.
+            assert len(entry.group) == args.n_samples_per_prompt or args.never_give_up > 0
 
             if do_print:
                 sample = first_sample(entry.group)

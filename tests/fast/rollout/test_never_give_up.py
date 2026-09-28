@@ -12,6 +12,7 @@ import torch
 
 import miles.rollout.inference_rollout.inference_rollout_train as train
 from miles.rollout.data_source import RolloutDataSourceWithBuffer
+from miles.rollout.fully_async_data_buffer import DataBufferConstructorInput, DataBufferInput, DefaultDataBuffer
 from miles.rollout.never_give_up import (
     NGU_ATTEMPT_COUNT_KEY,
     NGU_BASELINE_REWARD_SUM_KEY,
@@ -22,10 +23,11 @@ from miles.rollout.never_give_up import (
     anchor_positive_advantages,
     decide_never_give_up,
     make_retry_group,
+    prune_stale_attempts,
     should_accept_attempt,
 )
 from miles.utils.arguments import _validate_never_give_up_args
-from miles.utils.types import Sample
+from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
 GROUP_SIZE = 4
 
@@ -60,7 +62,7 @@ def _decide(state, group, *, filter_keep, rollout_id=0, config=None, rng_value=0
         rewards=[sample.reward for sample in group],
         filter_keep=filter_keep,
         prompt_template=Sample(group_index=group[0].group_index, prompt="prompt"),
-        rollout_id=rollout_id,
+        step=rollout_id,
         rng=rng,
     )
 
@@ -311,11 +313,15 @@ class TestValidateNeverGiveUpArgs:
             fully_async=False,
             partial_rollout=False,
             use_dynamic_global_batch_size=True,
+            custom_async_data_buffer_path=None,
         )
         return Namespace(**{**defaults, **overrides})
 
     def test_supported_setup_passes(self):
         _validate_never_give_up_args(self._args())
+
+    def test_fully_async_with_the_default_buffer_passes(self):
+        _validate_never_give_up_args(self._args(fully_async=True))
 
     def test_disabled_skips_every_other_check(self):
         _validate_never_give_up_args(self._args(never_give_up=0.0, dynamic_sampling_filter_path=None))
@@ -325,7 +331,7 @@ class TestValidateNeverGiveUpArgs:
         [
             dict(never_give_up=1.5),
             dict(dynamic_sampling_filter_path=None),
-            dict(fully_async=True),
+            dict(fully_async=True, custom_async_data_buffer_path="my.Buffer"),
             dict(partial_rollout=True),
             dict(use_dynamic_global_batch_size=False),
         ],
@@ -333,3 +339,85 @@ class TestValidateNeverGiveUpArgs:
     def test_unsupported_setups_are_rejected(self, overrides):
         with pytest.raises(AssertionError):
             _validate_never_give_up_args(self._args(**overrides))
+
+
+class TestPruneStaleAttempts:
+    def test_keeps_fresh_attempts_and_always_the_accepted_one(self):
+        stale, fresh, accepted = _group(7, [0.0] * 2), _group(7, [0.0] * 2, 2), _group(7, [1.0, 0.0], 4)
+        pruned = prune_stale_attempts(
+            [*stale, *fresh, *accepted], attempt_size=2, is_stale=lambda attempt: attempt[0] in (stale[0], accepted[0])
+        )
+
+        assert [sample.index for sample in pruned] == [2, 3, 4, 5]
+
+
+def _versioned(group: list[Sample], version: int) -> list[Sample]:
+    for sample in group:
+        sample.weight_versions = [
+            WeightVersionsPerCall(spans=[WeightVersionSpan(version=str(version), abs_start=0, abs_end=1)])
+        ]
+    return group
+
+
+class TestFullyAsyncDataBufferWithNeverGiveUp:
+    @staticmethod
+    def _buffer(max_weight_staleness=None):
+        args = Namespace(
+            rollout_batch_size=1,
+            n_samples_per_prompt=GROUP_SIZE,
+            async_data_buffer_capacity_factor=1000.0,
+            max_weight_staleness=max_weight_staleness,
+            dynamic_sampling_filter_path=f"{__name__}.nonzero_std",
+            reward_key=None,
+            never_give_up=1.0,
+            ngu_max_pending_age=4,
+            ngu_keep_pending_completions=True,
+            ngu_solved_reward=1.0,
+        )
+        source = RolloutDataSourceWithBuffer(_data_source_args())
+        buffer = DefaultDataBuffer(
+            DataBufferConstructorInput(args=args, unused_handler_fn=lambda group: None, never_give_up_source=source)
+        )
+        return buffer, source
+
+    @staticmethod
+    async def _put(buffer, group):
+        await buffer.put(DataBufferInput(prompt_group=group, group=group))
+
+    def test_requeued_prompt_is_merged_when_an_attempt_improves(self):
+        async def run():
+            buffer, source = self._buffer()
+            await self._put(buffer, _group(0, [0.0] * GROUP_SIZE))
+            [retry] = source.get_samples(1)
+            for sample, reward in zip(retry, [1.0, 0.0, 0.0, 0.0], strict=True):
+                sample.reward, sample.status = reward, Sample.Status.COMPLETED
+            await self._put(buffer, retry)
+            return await buffer.get(), buffer.get_metrics()
+
+        entry, metrics = asyncio.run(run())
+
+        assert len(entry.group) == 2 * GROUP_SIZE
+        assert entry.group[0].metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] == 2 * GROUP_SIZE
+        assert metrics["rollout/never_give_up/requeue"] == 1
+        assert metrics["rollout/never_give_up/keep"] == 1
+
+    def test_consuming_a_merged_group_prunes_stale_attempts_instead_of_dropping_it(self):
+        async def run():
+            buffer, source = self._buffer(max_weight_staleness=2)
+            await self._put(buffer, _versioned(_group(0, [0.0] * GROUP_SIZE, first_index=100), version=1))
+            [retry] = source.get_samples(1)
+            for sample, reward in zip(retry, [1.0, 0.0, 0.0, 0.0], strict=True):
+                sample.reward, sample.status = reward, Sample.Status.COMPLETED
+            await self._put(buffer, _versioned(retry, version=4))
+            return await buffer.get(current_version=5), buffer.get_metrics()
+
+        entry, metrics = asyncio.run(run())
+
+        assert [sample.index for sample in entry.group] == [0, 1, 2, 3]  # the retry's fresh indices
+        # The pruned attempt still counts toward the baseline.
+        assert entry.group[0].metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] == 2 * GROUP_SIZE
+        assert metrics["rollout/fully_async/stale_groups_filtered"] == 0
+
+
+def nonzero_std(_args, group, **_kwargs):
+    return len({sample.reward for sample in group}) > 1
