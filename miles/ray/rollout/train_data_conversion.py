@@ -3,6 +3,7 @@ from typing import Any
 
 import torch
 
+from miles.rollout.never_give_up import anchor_positive_advantages, ngu_baseline_mean
 from miles.utils import object_store
 from miles.utils.dp_schedule import build_dp_schedule, has_full_schedule_config
 from miles.utils.lora.utils import is_multi_lora_enabled
@@ -256,11 +257,15 @@ def _normalize_rewards_by_rollout(
             shared_rewards.append(sibling_rewards[0])
 
         rollout_rewards = torch.tensor(shared_rewards, dtype=torch.float)
-        normalized_rollout_rewards = rollout_rewards - rollout_rewards.mean()
+        ngu_baseline = _never_give_up_baseline(args, [samples[segment_index] for segment_index in prompt_segments])
+        baseline = rollout_rewards.mean() if ngu_baseline is None else ngu_baseline
+        normalized_rollout_rewards = rollout_rewards - baseline
         if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization and len(rollout_rewards) > 1:
             rollout_std = rollout_rewards.std()
             if rollout_std > 0:
                 normalized_rollout_rewards = normalized_rollout_rewards / (rollout_std + 1e-6)
+        if ngu_baseline is not None:
+            normalized_rollout_rewards = anchor_positive_advantages(normalized_rollout_rewards, rollout_rewards)
 
         for (_, rollout_segments), normalized_reward in zip(
             rollout_segment_groups, normalized_rollout_rewards.tolist(), strict=True
@@ -269,6 +274,14 @@ def _normalize_rewards_by_rollout(
                 normalized_rewards[segment_index] = normalized_reward
 
     return normalized_rewards.tolist()
+
+
+def _never_give_up_baseline(args: Any, group_samples: list[Sample]) -> float | None:
+    """The chain-wide mean reward of a never_give_up group. Keeping every pending attempt
+    (--ngu-max-pending-age -1) makes it the plain group mean, so it is not used then."""
+    if getattr(args, "never_give_up", 0) <= 0 or args.ngu_max_pending_age < 0:
+        return None
+    return ngu_baseline_mean(group_samples)
 
 
 def _post_process_rewards(

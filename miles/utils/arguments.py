@@ -65,6 +65,24 @@ def resolve_rollout_function_paths(args) -> tuple[str, str]:
     return rollout_path, eval_path
 
 
+def _validate_never_give_up_args(args) -> None:
+    assert 0.0 <= args.never_give_up <= 1.0, f"--never-give-up must be in [0, 1], got {args.never_give_up}"
+    if args.never_give_up == 0:
+        return
+    assert (
+        args.dynamic_sampling_filter_path is not None
+    ), "--never-give-up retries groups the dynamic sampling filter rejects; set --dynamic-sampling-filter-path"
+    assert (
+        not use_legacy_rollout_v1()
+    ), "--never-give-up needs the class-based rollout; unset MILES_USE_LEGACY_ROLLOUT_V1"
+    assert (
+        args.rollout_function_path is None and not args.fully_async
+    ), "--never-give-up is implemented in the default rollout function only"
+    assert not args.partial_rollout, "--never-give-up does not support --partial-rollout"
+    # Merged groups make the sample count vary, and trimming it to --global-batch-size could split one.
+    assert args.use_dynamic_global_batch_size, "--never-give-up requires --use-dynamic-global-batch-size"
+
+
 def _resolve_rollout_functions(args) -> None:
     if args.rollout_function_path == FULLY_ASYNC_ROLLOUT_PATH:
         # The selection --fully-async makes, so enable the mode: as a plugin path it would
@@ -808,6 +826,42 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "We will do dynamic filter for sampling as in DAPO. e.g. not all correct or all wrong samples."
                     "You could use `miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std` as an example."
                 ),
+            )
+            parser.add_argument(
+                "--never-give-up",
+                type=float,
+                default=0.0,
+                help=(
+                    "Never Give Up (NGU): probability in [0, 1] that an unsolved prompt group rejected by "
+                    "--dynamic-sampling-filter-path is requeued for another attempt instead of dropped. "
+                    "Earlier attempts are buffered until an attempt's max reward beats the best so far; "
+                    "then all attempts train together as one group, with the mean reward over the whole "
+                    "chain of attempts as the baseline. 0 disables NGU."
+                ),
+            )
+            parser.add_argument(
+                "--ngu-max-pending-age",
+                type=int,
+                default=4,
+                help=(
+                    "Max age, in rollouts, of buffered NGU attempts that train alongside the accepted one. "
+                    "Older attempts still count toward the baseline. -1 keeps every attempt, which makes "
+                    "the baseline the plain group mean."
+                ),
+            )
+            parser.add_argument(
+                "--ngu-keep-pending-completions",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Train on the buffered NGU attempts' completions, not only count their rewards in the " "baseline."
+                ),
+            )
+            parser.add_argument(
+                "--ngu-solved-reward",
+                type=float,
+                default=1.0,
+                help="Reward at which a prompt counts as solved; NGU never requeues a solved prompt.",
             )
             parser.add_argument(
                 "--rollout-submission-granularity",
@@ -3729,6 +3783,7 @@ def miles_validate_args(args):
         )
 
     _resolve_rollout_functions(args)
+    _validate_never_give_up_args(args)
 
     # Both snapshot postures drive the same RolloutManager._eval_checkpoint path.
     # (The fleet-vs-CheckpointEvalFn conflict is asserted where the posture is derived.)

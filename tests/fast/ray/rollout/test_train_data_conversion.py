@@ -355,6 +355,40 @@ class TestPostProcessRewards:
         expected_std = float(np.std([-1.5, -0.5, 0.5, 1.5]))
         assert abs(np.std(processed) - expected_std) < 1e-5
 
+    def test_never_give_up_group_uses_chain_baseline_and_anchors_positives(self):
+        """A merged NGU group centers on the chain-wide mean, keeps the max-reward advantage and sums to zero."""
+        args = make_args(
+            advantage_estimator="grpo",
+            rewards_normalization=True,
+            grpo_std_normalization=False,
+            never_give_up=1.0,
+            ngu_max_pending_age=4,
+        )
+        samples = make_samples_grouped(1, 4, rewards=[0.0, 0.0, 0.0, 1.0])
+        for sample in samples:
+            # Two earlier all-zero attempts of 4 samples each were buffered, so the chain mean is 1 / 12.
+            sample.metadata.update(ngu_baseline_reward_sum=1.0, ngu_baseline_sample_count=12)
+        _, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+
+        assert processed[3] == pytest.approx(1.0 - 1.0 / 12)
+        assert sum(processed) == pytest.approx(0.0, abs=1e-6)
+        assert processed[0] == pytest.approx(processed[1])
+
+    def test_never_give_up_baseline_is_ignored_when_every_attempt_is_kept(self):
+        args = make_args(
+            advantage_estimator="grpo",
+            rewards_normalization=True,
+            grpo_std_normalization=False,
+            never_give_up=1.0,
+            ngu_max_pending_age=-1,
+        )
+        samples = make_samples_grouped(1, 4, rewards=[0.0, 0.0, 0.0, 1.0])
+        for sample in samples:
+            sample.metadata.update(ngu_baseline_reward_sum=1.0, ngu_baseline_sample_count=12)
+        _, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+
+        assert processed == pytest.approx([-0.25, -0.25, -0.25, 0.75])
+
     def test_irregular_group_size_uses_explicit_group_index(self):
         """Explicit group identity keeps an irregularly sized group together."""
         args = make_args(

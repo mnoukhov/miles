@@ -210,6 +210,13 @@ class InferenceRolloutFn(BaseRolloutFn):
     def __init__(self, input: RolloutFnConstructorInput):
         super().__init__(input)
         self.data_source = input.data_source
+        # never_give_up keeps its retry chains on the data source and requeues prompts through it.
+        self.never_give_up_source = self.data_source if input.args.never_give_up > 0 else None
+        if self.never_give_up_source is not None:
+            assert hasattr(self.data_source, "requeue_prompt"), (
+                "--never-give-up requeues prompts through the data source; "
+                "use a --data-source-path like RolloutDataSourceWithBuffer that has requeue_prompt"
+            )
         self.state = GenerateState(input.args)
         self.eval_prompt_dataset_cache = {}
 
@@ -222,7 +229,10 @@ class InferenceRolloutFn(BaseRolloutFn):
         from miles.rollout.inference_rollout.inference_rollout_train import generate_rollout_async
 
         output, aborted_samples = await generate_rollout_async(
-            self.state, input.rollout_id, self.data_source.get_samples
+            self.state,
+            input.rollout_id,
+            self.data_source.get_samples,
+            never_give_up_source=self.never_give_up_source,
         )
         self.data_source.add_samples(aborted_samples)
         return output

@@ -2,10 +2,12 @@ import abc
 import copy
 import logging
 import os
+import random
 from pathlib import Path
 
 import torch
 
+from miles.rollout.never_give_up import NeverGiveUpState, make_retry_group
 from miles.utils.data import Dataset
 from miles.utils.function_registry import load_function
 from miles.utils.processing_utils import load_processor, load_tokenizer
@@ -16,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 def compute_global_dataset_state_path(directory: str, *, rollout_id: int | None) -> str:
     return os.path.join(directory, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+
+
+def compute_never_give_up_state_path(directory: str, *, rollout_id: int | None) -> str:
+    return os.path.join(directory, f"rollout/never_give_up_state_{rollout_id}.pt")
 
 
 class DataSource(abc.ABC):
@@ -175,6 +181,9 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             self.buffer_filter = pop_first
         else:
             self.buffer_filter = load_function(self.args.buffer_filter_path)
+        # never_give_up retry chains outlive a single rollout, so they live here with the buffer.
+        self.never_give_up_state = NeverGiveUpState()
+        self.never_give_up_rng = random.Random(getattr(args, "rollout_seed", None))
 
     def get_samples(self, num_samples: int) -> list[list[Sample]]:
         """
@@ -211,6 +220,34 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             ), f"the length of the elements of samples must be equal to n_samples_per_prompt, got {len(samples[i])} != {self.args.n_samples_per_prompt}"
             group = samples[i]  # type: ignore
             self.buffer.append(group)
+
+    def requeue_prompt(self, prompt_template: Sample) -> None:
+        """Put a fresh group for a never_give_up retry in front of new data. The retry keeps the
+        template's group_index and gets new sample indices."""
+        sample_indices = list(range(self.sample_index, self.sample_index + self.args.n_samples_per_prompt))
+        self.sample_index += self.args.n_samples_per_prompt
+        self.buffer.append(make_retry_group(prompt_template, sample_indices=sample_indices))
+
+    def save(self, rollout_id):
+        super().save(rollout_id)
+        if not self.args.rollout_global_dataset or not getattr(self.args, "never_give_up", 0):
+            return
+        # Pending retries are only resumable together with the sample_index saved above.
+        path = compute_never_give_up_state_path(self.args.save, rollout_id=rollout_id)
+        torch.save({"state": self.never_give_up_state, "buffer": self.buffer}, path)
+
+    def load(self, rollout_id=None):
+        super().load(rollout_id)
+        if not self.args.rollout_global_dataset or not getattr(self.args, "never_give_up", 0) or not self.args.load:
+            return
+        path = compute_never_give_up_state_path(self.args.load, rollout_id=rollout_id)
+        if not os.path.exists(path):
+            logger.warning(f"no never_give_up state under {path}: pending retries start empty")
+            return
+        # The state holds Samples, which the weights-only loader refuses.
+        state_dict = torch.load(path, weights_only=False)
+        self.never_give_up_state = state_dict["state"]
+        self.buffer = state_dict["buffer"]
 
     # TODO remove
     def update_metadata(self, metadata: dict):
