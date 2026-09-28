@@ -10,12 +10,14 @@ import torch
 
 import miles.rollout.inference_rollout.inference_rollout_train as train
 from miles.rollout.data_source import RolloutDataSourceWithBuffer
+from miles.rollout.filter_hub.base_types import FilterOutput
+from miles.rollout.filter_hub.common_filters import REASON_ABORTED, REASON_KEPT, REASON_MISSING_REWARD, REASON_STALE
 from miles.rollout.fully_async_data_buffer import DataBufferConstructorInput, DataBufferInput, DefaultDataBuffer
 from miles.rollout.never_give_up import (
     NGU_ATTEMPT_COUNT_KEY,
     NGU_BASELINE_REWARD_SUM_KEY,
     NGU_BASELINE_SAMPLE_COUNT_KEY,
-    NeverGiveUpFilter,
+    NeverGiveUp,
     anchor_positive_advantages,
     make_retry_group,
     prune_stale_attempts,
@@ -35,7 +37,8 @@ def _args(**overrides) -> Namespace:
         rollout_seed=0,
         reward_key=None,
         dynamic_sampling_filter_path=f"{__name__}.nonzero_std",
-        never_give_up=1.0,
+        async_unused_samples_handler="never_give_up",
+        ngu_requeue_probability=1.0,
         ngu_solved_reward=1.0,
         async_data_buffer_capacity_factor=1000.0,
         max_weight_staleness=None,
@@ -44,7 +47,8 @@ def _args(**overrides) -> Namespace:
 
 
 def nonzero_std(_args, group, **_kwargs):
-    return len({sample.reward for sample in group}) > 1
+    keep = len({sample.reward for sample in group}) > 1
+    return FilterOutput(keep=keep, reason=None if keep else "zero_std")
 
 
 def _group(chain_id: int, rewards: list[float], *, first_index: int = 0, version: int | None = None) -> list[Sample]:
@@ -73,54 +77,61 @@ def _answer(retry: list[Sample], rewards: list[float], version: int | None = Non
     return retry
 
 
-def _make_filter(**overrides) -> tuple[NeverGiveUpFilter, RolloutDataSourceWithBuffer]:
+def _make_ngu(**overrides) -> tuple[NeverGiveUp, RolloutDataSourceWithBuffer]:
     args = _args(**overrides)
     source = RolloutDataSourceWithBuffer(args)
-    return NeverGiveUpFilter(args, dynamic_filter=nonzero_std, data_source=source), source
+    return NeverGiveUp(args, data_source=source), source
 
 
-class TestNeverGiveUpFilter:
+def _offer(ngu: NeverGiveUp, group: list[Sample]) -> FilterOutput:
+    """What a rollout does with a finished group: filter it, then tell the handler what became of it."""
+    output = nonzero_std(ngu._args, group)
+    ngu(group, group=group, reason=REASON_KEPT if output.keep else output.reason)
+    return output
+
+
+class TestNeverGiveUp:
     def test_group_with_signal_is_kept_with_its_own_baseline(self):
-        ngu, source = _make_filter()
+        ngu, source = _make_ngu()
         group = _group(7, [0.0, 1.0, 0.0, 1.0])
 
-        assert ngu(ngu._args, group).keep
+        assert _offer(ngu, group).keep
         assert len(group) == GROUP_SIZE
         assert group[0].metadata[NGU_BASELINE_REWARD_SUM_KEY] == 2.0
         assert group[0].metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] == GROUP_SIZE
         assert source.buffer == []
 
     def test_unsolved_group_without_signal_is_requeued_through_the_buffer(self):
-        ngu, source = _make_filter()
+        ngu, source = _make_ngu()
 
-        output = ngu(ngu._args, _group(7, [0.0] * GROUP_SIZE, first_index=100))
+        output = _offer(ngu, _group(7, [0.0] * GROUP_SIZE, first_index=100))
 
-        assert (output.keep, output.reason) == (False, "never_give_up_requeued")
+        assert (output.keep, output.reason) == (False, "zero_std")
         [retry] = source.get_samples(1)
         assert [sample.group_index for sample in retry] == [7] * GROUP_SIZE
         assert [sample.index for sample in retry] == [0, 1, 2, 3]
         assert all(sample.status == Sample.Status.PENDING and sample.reward is None for sample in retry)
 
     def test_solved_group_is_dropped_not_requeued(self):
-        ngu, source = _make_filter()
+        ngu, source = _make_ngu()
 
-        assert not ngu(ngu._args, _group(7, [1.0] * GROUP_SIZE)).keep
+        assert not _offer(ngu, _group(7, [1.0] * GROUP_SIZE)).keep
         assert source.buffer == []
 
-    def test_failed_coin_flip_drops_the_chain(self):
-        ngu, source = _make_filter(never_give_up=0.5)
+    def test_failed_draw_drops_the_chain(self):
+        ngu, source = _make_ngu(ngu_requeue_probability=0.5)
         ngu._rng.random = lambda: 0.99
 
-        assert not ngu(ngu._args, _group(7, [0.0] * GROUP_SIZE)).keep
+        assert not _offer(ngu, _group(7, [0.0] * GROUP_SIZE)).keep
         assert source.buffer == [] and ngu._chains == {}
 
     def test_improved_retry_is_merged_in_place_with_a_chain_wide_baseline(self):
-        ngu, source = _make_filter()
-        ngu(ngu._args, _group(7, [0.0] * GROUP_SIZE, first_index=100))
-        ngu(ngu._args, _answer(source.get_samples(1)[0], [0.0] * GROUP_SIZE))
+        ngu, source = _make_ngu()
+        _offer(ngu, _group(7, [0.0] * GROUP_SIZE, first_index=100))
+        _offer(ngu, _answer(source.get_samples(1)[0], [0.0] * GROUP_SIZE))
         retry = _answer(source.get_samples(1)[0], [0.0, 0.0, 0.0, 1.0])
 
-        assert ngu(ngu._args, retry).keep
+        assert _offer(ngu, retry).keep
         assert len(retry) == 3 * GROUP_SIZE
         assert len({sample.index for sample in retry}) == 3 * GROUP_SIZE
         assert {sample.group_index for sample in retry} == {7}
@@ -130,26 +141,36 @@ class TestNeverGiveUpFilter:
         assert ngu._chains == {}
 
     def test_a_retry_that_only_ties_the_best_reward_is_requeued_again(self):
-        ngu, source = _make_filter(ngu_solved_reward=2.0)
-        ngu(ngu._args, _group(7, [0.0, 0.0, 0.0, 1.0]))  # kept: has signal
-        ngu(ngu._args, _group(8, [0.0] * GROUP_SIZE))
-        tie = _answer(source.get_samples(1)[0], [0.0] * GROUP_SIZE)
+        ngu, source = _make_ngu(ngu_solved_reward=2.0)
+        _offer(ngu, _group(9, [0.5] * GROUP_SIZE, first_index=100))
+        tie = _answer(source.get_samples(1)[0], [0.5] * GROUP_SIZE)
 
-        assert not ngu(ngu._args, tie).keep
+        output = _offer(ngu, tie)
+
+        assert (output.keep, output.reason) == (False, "zero_std")
         assert len(source.buffer) == 1
 
+    def test_a_retry_the_filter_keeps_is_merged_even_without_beating_the_earlier_best(self):
+        ngu, source = _make_ngu(ngu_solved_reward=2.0)
+        _offer(ngu, _group(9, [0.5] * GROUP_SIZE, first_index=100))
+        retry = _answer(source.get_samples(1)[0], [0.0, 0.0, 0.0, 0.5])
+
+        assert _offer(ngu, retry).keep
+        assert len(retry) == 2 * GROUP_SIZE
+        assert source.buffer == []
+
     def test_stale_attempts_leave_the_merge_but_stay_in_the_baseline(self):
-        ngu, source = _make_filter(max_weight_staleness=2)
-        ngu(ngu._args, _group(7, [0.0] * GROUP_SIZE, first_index=100, version=0))
+        ngu, source = _make_ngu(max_weight_staleness=2)
+        _offer(ngu, _group(7, [0.0] * GROUP_SIZE, first_index=100, version=0))
         retry = _answer(source.get_samples(1)[0], [0.0, 1.0, 0.0, 0.0], version=5)
 
-        assert ngu(ngu._args, retry).keep
+        assert _offer(ngu, retry).keep
         assert [sample.index for sample in retry] == [0, 1, 2, 3]
         assert retry[0].metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] == 2 * GROUP_SIZE
 
     def test_lost_retries_are_requeued(self):
-        ngu, source = _make_filter()
-        ngu(ngu._args, _group(7, [0.0] * GROUP_SIZE, first_index=100))
+        ngu, source = _make_ngu()
+        _offer(ngu, _group(7, [0.0] * GROUP_SIZE, first_index=100))
         source.get_samples(1)  # the retry is drawn, then lost (e.g. aborted at the end of a rollout)
 
         ngu.requeue_lost_retries()
@@ -157,6 +178,71 @@ class TestNeverGiveUpFilter:
         assert [group[0].group_index for group in source.buffer] == [7]
         ngu.requeue_lost_retries()  # already buffered, so not requeued twice
         assert len(source.buffer) == 1
+
+
+class TestStaleGroups:
+    def test_a_stale_group_keeps_going_even_when_requeues_are_otherwise_refused(self):
+        ngu, source = _make_ngu(ngu_requeue_probability=0.0)
+        merged = _group(7, [0.0, 0.0, 0.0, 1.0], first_index=100, version=1)
+        assert _offer(ngu, merged).keep
+
+        ngu(merged, group=merged, reason=REASON_STALE)
+
+        [retry] = source.get_samples(1)
+        assert [sample.group_index for sample in retry] == [7] * GROUP_SIZE
+        assert all(NGU_BASELINE_REWARD_SUM_KEY not in sample.metadata for sample in retry)
+
+    def test_the_retry_of_a_stale_group_trains_with_its_completions_merged_back(self):
+        ngu, source = _make_ngu(ngu_solved_reward=2.0)
+        stale = _group(7, [0.0, 0.0, 0.0, 1.0], first_index=100, version=1)
+        assert _offer(ngu, stale).keep
+        ngu(stale, group=stale, reason=REASON_STALE)
+        retry = _answer(source.get_samples(1)[0], [0.0, 1.0, 0.0, 0.0], version=9)
+
+        assert _offer(ngu, retry).keep
+
+        assert len(retry) == 2 * GROUP_SIZE  # the stale attempt's completions are merged back
+        assert retry[0].metadata[NGU_BASELINE_REWARD_SUM_KEY] == 2.0
+        assert retry[0].metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] == 2 * GROUP_SIZE
+
+    def test_a_stale_merged_group_keeps_its_chain_baseline(self):
+        ngu, source = _make_ngu(ngu_solved_reward=2.0)
+        _offer(ngu, _group(7, [0.0] * GROUP_SIZE, first_index=100, version=1))
+        merged = _answer(source.get_samples(1)[0], [0.0, 0.0, 0.0, 1.0], version=2)
+        assert _offer(ngu, merged).keep and len(merged) == 2 * GROUP_SIZE
+        merged[:] = merged[GROUP_SIZE:]  # the fully-async buffer pruned the older attempt on consume
+
+        ngu(merged, group=merged, reason=REASON_STALE)
+        retry = _answer(source.get_samples(1)[0], [0.0, 1.0, 0.0, 0.0], version=9)
+
+        assert _offer(ngu, retry).keep
+        assert retry[0].metadata[NGU_BASELINE_REWARD_SUM_KEY] == 2.0  # 1.0 from the first, 1.0 from the retry
+        assert retry[0].metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] == 3 * GROUP_SIZE
+        assert retry[0].metadata[NGU_ATTEMPT_COUNT_KEY] == 3
+
+
+class TestAbortedAndMissingReward:
+    @pytest.mark.parametrize("reason", [REASON_ABORTED, REASON_MISSING_REWARD])
+    def test_a_failed_retry_is_requeued_as_it_was(self, reason):
+        ngu, source = _make_ngu()
+        _offer(ngu, _group(7, [0.0] * GROUP_SIZE, first_index=100))
+        retry = source.get_samples(1)[0]
+
+        ngu(retry, group=retry, reason=reason)
+
+        [requeued] = source.buffer
+        assert requeued[0].group_index == 7
+        assert [sample.index for sample in requeued] != [sample.index for sample in retry]
+        assert ngu._chains[7].attempt_count == 1  # nothing was learned from it
+
+    @pytest.mark.parametrize("reason", [REASON_ABORTED, REASON_MISSING_REWARD])
+    def test_a_failed_first_attempt_is_dropped(self, reason):
+        ngu, source = _make_ngu()
+        group = _group(7, [0.0] * GROUP_SIZE)
+
+        ngu(group, group=group, reason=reason)
+
+        assert source.buffer == [] and ngu._chains == {}
 
 
 class TestHelpers:
@@ -205,7 +291,7 @@ class TestGenerateRolloutWithNeverGiveUp:
             partial_rollout=False,
         )
         source = RolloutDataSourceWithBuffer(_args())
-        ngu = NeverGiveUpFilter(args, dynamic_filter=nonzero_std, data_source=source)
+        ngu = NeverGiveUp(args, data_source=source)
         attempts_of_chain: dict[int, int] = {}
 
         async def generate(group):
@@ -230,16 +316,18 @@ class TestGenerateRolloutWithNeverGiveUp:
             lambda _state, samples, sample_done_callback=None: [asyncio.ensure_future(generate(g)) for g in samples],
         )
         monkeypatch.setattr(train, "abort", fake_abort)
-        monkeypatch.setattr(train, "load_function", lambda path: None)
+        monkeypatch.setattr(
+            train, "load_function", lambda path: nonzero_std if path == args.dynamic_sampling_filter_path else None
+        )
         monkeypatch.setattr(train.dumper_utils, "configure_sglang", noop)
         monkeypatch.setattr(train, "recompute_samples_rollout_logprobs_via_prefill", noop)
 
-        output, _ = asyncio.run(train.generate_rollout_async(state, 0, source.get_samples, dynamic_filter=ngu))
+        output, _ = asyncio.run(train.generate_rollout_async(state, 0, source.get_samples, handle_unused=ngu))
 
         groups = {group[0].group_index: group for group in output.samples}
         assert len(groups[0]) == 2 * GROUP_SIZE
         assert groups[0][0].metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] == 2 * GROUP_SIZE
-        assert output.metrics["rollout/dynamic_filter/drop_never_give_up_requeued"] == 1
+        assert output.metrics["rollout/dynamic_filter/drop_zero_std"] == 1
 
 
 class TestFullyAsyncDataBufferWithNeverGiveUp:
@@ -247,14 +335,35 @@ class TestFullyAsyncDataBufferWithNeverGiveUp:
     def _buffer(**overrides):
         args = _args(**overrides)
         source = RolloutDataSourceWithBuffer(args)
-        buffer = DefaultDataBuffer(
-            DataBufferConstructorInput(args=args, unused_handler_fn=lambda group: None, data_source=source)
-        )
-        return buffer, source
+        ngu = NeverGiveUp(args, data_source=source)
+        return DefaultDataBuffer(DataBufferConstructorInput(args=args, unused_handler_fn=ngu)), source
 
     @staticmethod
     async def _put(buffer, group):
         await buffer.put(DataBufferInput(prompt_group=group, group=group))
+
+    def test_a_rejected_group_is_requeued_and_the_metric_names_the_real_reason(self):
+        async def run():
+            buffer, source = self._buffer()
+            await self._put(buffer, _group(0, [0.0] * GROUP_SIZE, first_index=100))
+            return source, buffer.get_metrics()
+
+        source, metrics = asyncio.run(run())
+
+        assert [group[0].group_index for group in source.buffer] == [0]
+        assert metrics["rollout/dynamic_filter/drop_zero_std"] == 1
+
+    def test_an_aborted_retry_is_requeued_instead_of_losing_the_chain(self):
+        async def run():
+            buffer, source = self._buffer()
+            await self._put(buffer, _group(0, [0.0] * GROUP_SIZE, first_index=100))
+            retry = source.get_samples(1)[0]
+            for sample in retry:
+                sample.status = Sample.Status.ABORTED
+            await self._put(buffer, retry)
+            return source
+
+        assert [group[0].group_index for group in asyncio.run(run()).buffer] == [0]
 
     def test_consuming_a_merged_group_prunes_stale_attempts_instead_of_dropping_it(self):
         async def run():
@@ -279,12 +388,29 @@ class TestFullyAsyncDataBufferWithNeverGiveUp:
 
         assert len(asyncio.run(run()).group) == 2 * GROUP_SIZE
 
+    def test_a_group_whose_kept_attempt_is_stale_becomes_a_failure_that_keeps_going(self):
+        async def run():
+            buffer, source = self._buffer(max_weight_staleness=2)
+            await self._put(buffer, _group(0, [0.0, 0.0, 0.0, 1.0], first_index=100, version=1))
+            buffer._current_version = 9
+            fresh = _group(1, [1.0, 0.0, 0.0, 0.0], first_index=200, version=9)
+            await self._put(buffer, fresh)
+            return await buffer.get(current_version=9), source, buffer.get_metrics()
+
+        entry, source, metrics = asyncio.run(run())
+
+        assert entry.group[0].group_index == 1  # the fresh group trains
+        assert metrics["rollout/fully_async/stale_groups_filtered"] == 1
+        [retry] = source.buffer
+        assert retry[0].group_index == 0
+
 
 class TestValidateNeverGiveUpArgs:
     @staticmethod
     def _args(**overrides) -> Namespace:
         defaults = dict(
-            never_give_up=0.5,
+            async_unused_samples_handler="never_give_up",
+            ngu_requeue_probability=0.5,
             dynamic_sampling_filter_path="miles.rollout.filter_hub.common_filters.apply_reward_nonzero_std_filter",
             rollout_function_path=None,
             fully_async=False,
@@ -298,13 +424,15 @@ class TestValidateNeverGiveUpArgs:
         _validate_never_give_up_args(self._args())
         _validate_never_give_up_args(self._args(fully_async=True))
 
-    def test_disabled_skips_every_other_check(self):
-        _validate_never_give_up_args(self._args(never_give_up=0.0, dynamic_sampling_filter_path=None))
+    def test_other_handlers_skip_every_other_check(self):
+        _validate_never_give_up_args(
+            self._args(async_unused_samples_handler="drop", dynamic_sampling_filter_path=None)
+        )
 
     @pytest.mark.parametrize(
         "overrides",
         [
-            dict(never_give_up=1.5),
+            dict(ngu_requeue_probability=1.5),
             dict(dynamic_sampling_filter_path=None),
             dict(fully_async=True, custom_async_data_buffer_path="my.Buffer"),
             dict(partial_rollout=True),

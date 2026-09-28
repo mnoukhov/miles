@@ -18,6 +18,7 @@ rollout engines, pausing producer submissions for the duration of the
 
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import replace
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
@@ -31,6 +32,7 @@ from miles.rollout.base_types import (
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
 )
+from miles.rollout.filter_hub.common_filters import REASON_ABORTED, REASON_STALE
 from miles.rollout.fully_async_data_buffer import (
     DataBuffer,
     DataBufferConstructorInput,
@@ -44,6 +46,7 @@ from miles.rollout.fully_async_data_buffer import (
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
+from miles.rollout.never_give_up import NeverGiveUp
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
@@ -71,11 +74,9 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self.state = GenerateState(input.args)
         # default to sample level backfill for fully async rollout
         self._scheduler = make_submission_scheduler(input.args, default="sample")
-        assert input.args.async_unused_samples_handler in ("retry", "drop")
-        # applied to every group we do not train on; "drop" discards instead of recycling
-        self._handle_unused = (
-            self._recycle if input.args.async_unused_samples_handler == "retry" else (lambda prompt_group: None)
-        )
+        assert input.args.async_unused_samples_handler in ("retry", "drop", "never_give_up")
+        # applied to every group we do not train on, with the reason it is unused
+        self._handle_unused = self._make_unused_handler(input.args.async_unused_samples_handler)
         self._sample_filter = load_function(input.args.rollout_sample_filter_path)
         self._worker: asyncio.Task | None = None
         self._eval_prompt_dataset_cache: dict = {}
@@ -92,9 +93,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             )
             buffer_cls = load_function(self.args.custom_async_data_buffer_path) or default_buffer_cls
             self._output = buffer_cls(
-                DataBufferConstructorInput(
-                    args=self.args, unused_handler_fn=self._handle_unused, data_source=self.data_source
-                )
+                DataBufferConstructorInput(args=self.args, unused_handler_fn=self._handle_unused)
             )
             self._worker = asyncio.create_task(self._worker_loop())
             logger.info("Started fully-async rollout worker")
@@ -207,7 +206,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             entry = await self._next_group(
                 current_version=input.weight_version, trainer_model_id=input.trainer_model_id
             )
-            # A --never-give-up group merges several attempts at its prompt.
+            # A never_give_up group merges several attempts at its prompt.
             assert len(entry.group) % args.n_samples_per_prompt == 0
 
             if do_print:
@@ -236,6 +235,18 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             self._sample_filter(args, data)
 
         return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics(input.trainer_model_id))
+
+    def _make_unused_handler(self, name: str) -> Callable[..., None]:
+        if name == "never_give_up":
+            return NeverGiveUp(self.args, data_source=self.data_source)
+        if name == "retry":
+            return self._recycle_unfinished
+        return lambda prompt_group, **_: None
+
+    def _recycle_unfinished(self, prompt_group: list[Sample], *, reason: str | None = None, **_) -> None:
+        """Recycle aborted and stale groups; groups the filters reject are dropped."""
+        if reason in (None, REASON_ABORTED, REASON_STALE):
+            self._recycle(prompt_group)
 
     def _recycle(self, prompt_group: list[Sample]) -> None:
         for sample in prompt_group:

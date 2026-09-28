@@ -8,7 +8,7 @@ from miles.rollout.inference_rollout.inference_rollout_common import InferenceRo
 def test_inference_rollout_fn_exposes_the_constructor_input(monkeypatch) -> None:
     """The base class promises constructor_input, so the framework's own subclasses must set it too."""
     monkeypatch.setattr(inference_rollout_common, "GenerateState", lambda args: MagicMock())
-    constructor_input = RolloutFnConstructorInput(args=MagicMock(never_give_up=0.0), data_source=MagicMock())
+    constructor_input = RolloutFnConstructorInput(args=MagicMock(), data_source=MagicMock())
 
     fn = InferenceRolloutFn(constructor_input)
 

@@ -8,6 +8,13 @@ from miles.utils.types import Sample
 
 Group = list[Sample | list[Sample]]
 
+# Why a group reached the unused-samples handler (besides a dynamic filter's own reason).
+# REASON_KEPT marks a group that trains after all: only the never_give_up handler is told.
+REASON_KEPT = "kept"
+REASON_ABORTED = "group_has_aborted"
+REASON_MISSING_REWARD = "group_has_missing_reward"
+REASON_STALE = "stale"
+
 
 @dataclass(frozen=True)
 class GroupWeightVersionStats:
@@ -82,13 +89,13 @@ def apply_preput_filters(args: Namespace, dynamic_filter, samples: Group, **kwar
 def apply_aborted_filter(args: Namespace, samples: Group, **kwargs) -> FilterOutput:
     """Reject entire group if any sample was aborted (e.g. env timeout, Docker crash)."""
     if any(sample.status == Sample.Status.ABORTED for sample in iter_samples(samples)):
-        return FilterOutput(keep=False, reason="group_has_aborted")
+        return FilterOutput(keep=False, reason=REASON_ABORTED)
     return FilterOutput(keep=True)
 
 
 def apply_missing_reward_filter(args: Namespace, samples: Group, **kwargs) -> FilterOutput:
     if any(sample.reward is None or sample.get_reward_value(args) is None for sample in iter_samples(samples)):
-        return FilterOutput(keep=False, reason="group_has_missing_reward")
+        return FilterOutput(keep=False, reason=REASON_MISSING_REWARD)
     return FilterOutput(keep=True)
 
 

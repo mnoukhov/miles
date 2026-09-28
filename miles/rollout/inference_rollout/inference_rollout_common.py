@@ -20,9 +20,8 @@ from miles.rollout.base_types import (
 from miles.rollout.generate_hub.single_turn import generate
 from miles.rollout.generate_utils.generate_endpoint_utils import policy_uses_routing_key
 from miles.rollout.inference_rollout.compatibility import load_generate_function
-from miles.rollout.never_give_up import NeverGiveUpFilter
+from miles.rollout.never_give_up import NeverGiveUp
 from miles.rollout.rm_hub import async_rm, batched_async_rm
-from miles.utils.function_registry import load_function
 from miles.utils.lifecycle import TrajectoryLifecycle
 from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.types import Sample
@@ -213,13 +212,9 @@ class InferenceRolloutFn(BaseRolloutFn):
         super().__init__(input)
         self.data_source = input.data_source
         # Stateful across rollouts: it holds the prompts it keeps retrying.
-        self.never_give_up_filter = (
-            NeverGiveUpFilter(
-                input.args,
-                dynamic_filter=load_function(input.args.dynamic_sampling_filter_path),
-                data_source=self.data_source,
-            )
-            if input.args.never_give_up > 0
+        self.never_give_up = (
+            NeverGiveUp(input.args, data_source=self.data_source)
+            if input.args.async_unused_samples_handler == "never_give_up"
             else None
         )
         self.state = GenerateState(input.args)
@@ -234,11 +229,11 @@ class InferenceRolloutFn(BaseRolloutFn):
         from miles.rollout.inference_rollout.inference_rollout_train import generate_rollout_async
 
         output, aborted_samples = await generate_rollout_async(
-            self.state, input.rollout_id, self.data_source.get_samples, dynamic_filter=self.never_give_up_filter
+            self.state, input.rollout_id, self.data_source.get_samples, handle_unused=self.never_give_up
         )
         self.data_source.add_samples(aborted_samples)
-        if self.never_give_up_filter is not None:
-            self.never_give_up_filter.requeue_lost_retries()
+        if self.never_give_up is not None:
+            self.never_give_up.requeue_lost_retries()
         return output
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnEvalOutput:

@@ -361,7 +361,7 @@ class TestPostProcessRewards:
             advantage_estimator="grpo",
             rewards_normalization=True,
             grpo_std_normalization=False,
-            never_give_up=1.0,
+            async_unused_samples_handler="never_give_up",
         )
         samples = make_samples_grouped(1, 4, rewards=[0.0, 0.0, 0.0, 1.0])
         for sample in samples:
@@ -378,7 +378,7 @@ class TestPostProcessRewards:
             advantage_estimator="grpo",
             rewards_normalization=True,
             grpo_std_normalization=False,
-            never_give_up=1.0,
+            async_unused_samples_handler="never_give_up",
         )
         samples = make_samples_grouped(1, 4, rewards=[0.0, 0.0, 0.0, 1.0])
         for sample in samples:

@@ -15,16 +15,17 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
-from miles.rollout.data_source import DataSource
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, iter_samples
 from miles.rollout.filter_hub.common_filters import (
+    REASON_KEPT,
+    REASON_STALE,
     GroupWeightVersionStats,
     apply_aborted_filter,
     apply_missing_reward_filter,
     group_staleness,
     group_weight_version_stats,
 )
-from miles.rollout.never_give_up import NeverGiveUpFilter, prune_stale_attempts
+from miles.rollout.never_give_up import NeverGiveUp, prune_stale_attempts
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
 
@@ -67,8 +68,8 @@ def first_sample(group: Group) -> Sample:
 
 class DataBufferConstructorInput:
     args: Namespace
-    unused_handler_fn: Callable[[list[Sample]], None]  # --async-unused-samples-handler, applied to unused groups
-    data_source: DataSource | None = None  # where --never-give-up requeues retries
+    # --async-unused-samples-handler, applied to unused groups with the reason they are unused
+    unused_handler_fn: Callable[..., None]
 
 
 @dataclass
@@ -125,9 +126,11 @@ class DefaultDataBuffer(DataBuffer):
         floor(factor * rollout_batch_size) groups; when full, put blocks until
         training consumes.
     (2) unused handling: ``--async-unused-samples-handler`` decides what happens
-        to aborted and stale groups: drop discards them, retry recycles their
-        prompts for regeneration. Missing-reward and custom-filter rejections
-        are discarded directly.
+        to unused groups, and is told why each is unused: drop discards them,
+        retry recycles the prompts of aborted and stale groups for regeneration,
+        never_give_up keeps retrying the prompts of every kind and merges kept
+        groups with their earlier attempts (see ``never_give_up.py``). Missing-reward and custom-filter rejections are
+        otherwise discarded.
     """
 
     def __init__(self, input: DataBufferConstructorInput):
@@ -141,10 +144,7 @@ class DefaultDataBuffer(DataBuffer):
 
         self._unused_handler_fn = input.unused_handler_fn
         self._dynamic_filter = load_function(args.dynamic_sampling_filter_path)
-        if args.never_give_up > 0:
-            self._dynamic_filter = NeverGiveUpFilter(
-                args, dynamic_filter=self._dynamic_filter, data_source=input.data_source
-            )
+        self._never_give_up = isinstance(input.unused_handler_fn, NeverGiveUp)
         self._cond = asyncio.Condition()
         self._current_version: int | None = None
 
@@ -173,19 +173,23 @@ class DefaultDataBuffer(DataBuffer):
         output = apply_aborted_filter(self._args, input.group)
         if not output.keep:
             self._metric_aborted_groups += 1
-            self._unused_handler_fn(input.prompt_group)
+            self._unused_handler_fn(input.prompt_group, group=input.group, reason=output.reason)
             return False
 
         output = apply_missing_reward_filter(self._args, input.group)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
+            self._unused_handler_fn(input.prompt_group, group=input.group, reason=output.reason)
             return False
 
         self._metric_gatherer.on_group_before_dynamic_filter(self._args, input.group)
         output = call_dynamic_filter(self._dynamic_filter, self._args, input.group)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
+            self._unused_handler_fn(input.prompt_group, group=input.group, reason=output.reason)
             return False
+        if self._never_give_up:
+            self._unused_handler_fn(input.prompt_group, group=input.group, reason=REASON_KEPT)
         return True
 
     async def get(self, current_version: int | None = None, **_) -> DataBufferInput:
@@ -197,7 +201,7 @@ class DefaultDataBuffer(DataBuffer):
                     await self._cond.wait()
                 entry = self._buffer.pop(0)
                 self._cond.notify_all()  # wake producers blocked on a full buffer
-                if self._args.never_give_up > 0:
+                if self._never_give_up:
                     entry.group = self._prune_stale_never_give_up_attempts(entry.group, current_version)
 
                 version_stats = group_weight_version_stats(entry.group)
@@ -206,7 +210,7 @@ class DefaultDataBuffer(DataBuffer):
                     if self._args.max_weight_staleness is not None and staleness > self._args.max_weight_staleness:
                         logger.info(f"Filtered stale group ({staleness=} > max={self._args.max_weight_staleness})")
                         self._metric_stale_groups += 1
-                        self._unused_handler_fn(entry.prompt_group)
+                        self._unused_handler_fn(entry.prompt_group, group=entry.group, reason=REASON_STALE)
                         continue
                     self._metric_consumed_staleness.append(staleness)
                 self._record_selected_version_stats(version_stats, current_version)

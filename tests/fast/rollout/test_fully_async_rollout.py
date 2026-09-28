@@ -96,7 +96,6 @@ def make_args(**overrides) -> Namespace:
         sglang_router_port=30000,
         sglang_router_request_timeout_secs=14400,
         eval_num_gpus=0,
-        never_give_up=0.0,
     )
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -516,7 +515,9 @@ def make_buffer(max_groups=None, max_staleness=None):
         max_weight_staleness=max_staleness,
     )
     buffer = data_buffer.DefaultDataBuffer(
-        data_buffer.DataBufferConstructorInput(args=args, unused_handler_fn=unused.append)
+        data_buffer.DataBufferConstructorInput(
+            args=args, unused_handler_fn=lambda prompt_group, **_: unused.append(prompt_group)
+        )
     )
     return buffer, unused
 
@@ -530,7 +531,7 @@ async def test_buffer_reports_unfiltered_raw_reward_across_kept_and_dropped():
     """The accepted-only raw_reward is conditioned by the filter, so this mean must still see dropped groups."""
     args = make_args(rollout_batch_size=1, dynamic_sampling_filter_path=f"{__name__}.reject_group_1")
     buffer = data_buffer.DefaultDataBuffer(
-        data_buffer.DataBufferConstructorInput(args=args, unused_handler_fn=lambda group: None)
+        data_buffer.DataBufferConstructorInput(args=args, unused_handler_fn=lambda prompt_group, **_: None)
     )
 
     await put_group(buffer, make_group(1, reward=0))
@@ -655,7 +656,9 @@ def make_multi_buffer(*model_ids: str, max_staleness=None, paths_per_model=None)
         custom_async_data_buffer_path_per_model=paths_per_model,
     )
     buffer = data_buffer.DefaultMultiDataBuffer(
-        data_buffer.DataBufferConstructorInput(args=args, unused_handler_fn=unused.append)
+        data_buffer.DataBufferConstructorInput(
+            args=args, unused_handler_fn=lambda prompt_group, **_: unused.append(prompt_group)
+        )
     )
     return buffer, unused
 
@@ -905,7 +908,9 @@ class TestPerPolicyBufferClass:
             "solver", "verifier", paths_per_model=[f"solver={__name__}.RecordingBuffer"]
         )
 
-        assert RecordingBuffer.constructed_with.unused_handler_fn == unused.append
+        group = make_group(0)
+        RecordingBuffer.constructed_with.unused_handler_fn(group, group=group, reason="stale")
+        assert unused == [group]
         assert RecordingBuffer.constructed_with.args is buffer._inners["verifier"]._args
 
     def test_a_policy_this_run_does_not_train_is_refused(self):
@@ -968,7 +973,7 @@ async def test_custom_data_buffer_path_replaces_default(monkeypatch):
     output = await fn(RolloutFnTrainInput(rollout_id=0))
 
     assert type(fn._output) is RecordingBuffer
-    assert RecordingBuffer.constructed_with.unused_handler_fn == fn._recycle
+    assert RecordingBuffer.constructed_with.unused_handler_fn == fn._recycle_unfinished
     assert len(output.samples) == 2
 
 

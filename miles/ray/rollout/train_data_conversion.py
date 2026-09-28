@@ -279,7 +279,7 @@ def _normalize_rewards_by_rollout(
 def _never_give_up_baseline(args: Any, group_samples: list[Sample]) -> float | None:
     """The chain-wide mean reward of a never_give_up group. It equals the plain group mean when
     no pending attempt was dropped for staleness."""
-    if getattr(args, "never_give_up", 0) <= 0:
+    if getattr(args, "async_unused_samples_handler", None) != "never_give_up":
         return None
     return ngu_baseline_mean(group_samples)
 

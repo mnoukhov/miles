@@ -9,10 +9,11 @@ from tqdm import tqdm
 
 from miles.rollout.base_types import RolloutFnTrainOutput
 from miles.rollout.filter_hub.base_types import MetricGatherer
-from miles.rollout.filter_hub.common_filters import apply_preput_filters
+from miles.rollout.filter_hub.common_filters import REASON_KEPT, apply_preput_filters
 from miles.rollout.generate_utils.prefill_logprobs import recompute_samples_rollout_logprobs_via_prefill
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
+from miles.rollout.never_give_up import NeverGiveUp
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils import dumper_utils
 from miles.utils.function_registry import load_function
@@ -94,7 +95,7 @@ async def generate_rollout_async(
     state: GenerateState,
     rollout_id: int,
     data_source: Callable[[int], list[list[Sample]]],
-    dynamic_filter: Callable | None = None,
+    handle_unused: Callable[..., None] | None = None,
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     args = state.args
     assert args.rollout_global_dataset
@@ -102,7 +103,7 @@ async def generate_rollout_async(
     await dumper_utils.configure_sglang(args)
 
     # instantiate data filters
-    dynamic_filter = dynamic_filter or load_function(args.dynamic_sampling_filter_path)
+    dynamic_filter = load_function(args.dynamic_sampling_filter_path)
 
     metric_gatherer = MetricGatherer()
 
@@ -151,11 +152,15 @@ async def generate_rollout_async(
             filter_output = apply_preput_filters(args, dynamic_filter, group)
             if not filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
+                if handle_unused is not None:
+                    handle_unused(group, group=group, reason=filter_output.reason)
                 continue
 
             # add the samples to the data
             # NOTE: here we have not stored all the unused samples back to the data buffer.
             if len(data) < target_data_size:
+                if isinstance(handle_unused, NeverGiveUp):
+                    handle_unused(group, group=group, reason=REASON_KEPT)
                 data.append(group)
                 pbar.update(len(group))
 
