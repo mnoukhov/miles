@@ -1,5 +1,6 @@
 from argparse import Namespace
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 
@@ -8,12 +9,17 @@ from miles.utils.types import Sample
 
 Group = list[Sample | list[Sample]]
 
-# Why a group reached the unused-samples handler (besides a dynamic filter's own reason).
-# REASON_KEPT marks a group that trains after all: only the never_give_up handler is told.
-REASON_KEPT = "kept"
-REASON_ABORTED = "group_has_aborted"
-REASON_MISSING_REWARD = "group_has_missing_reward"
-REASON_STALE = "stale"
+
+class Reasons(NamedTuple):
+    """Why a group reached the unused-samples handler (besides a dynamic filter's own reason)."""
+
+    aborted: str
+    missing_reward: str
+    stale: str
+    kept: str  # the group trains after all: only the never_give_up handler is told
+
+
+REASONS = Reasons(aborted="group_has_aborted", missing_reward="group_has_missing_reward", stale="stale", kept="kept")
 
 
 @dataclass(frozen=True)
@@ -89,13 +95,13 @@ def apply_preput_filters(args: Namespace, dynamic_filter, samples: Group, **kwar
 def apply_aborted_filter(args: Namespace, samples: Group, **kwargs) -> FilterOutput:
     """Reject entire group if any sample was aborted (e.g. env timeout, Docker crash)."""
     if any(sample.status == Sample.Status.ABORTED for sample in iter_samples(samples)):
-        return FilterOutput(keep=False, reason=REASON_ABORTED)
+        return FilterOutput(keep=False, reason=REASONS.aborted)
     return FilterOutput(keep=True)
 
 
 def apply_missing_reward_filter(args: Namespace, samples: Group, **kwargs) -> FilterOutput:
     if any(sample.reward is None or sample.get_reward_value(args) is None for sample in iter_samples(samples)):
-        return FilterOutput(keep=False, reason=REASON_MISSING_REWARD)
+        return FilterOutput(keep=False, reason=REASONS.missing_reward)
     return FilterOutput(keep=True)
 
 

@@ -11,7 +11,7 @@ import torch
 import miles.rollout.inference_rollout.inference_rollout_train as train
 from miles.rollout.data_source import RolloutDataSourceWithBuffer
 from miles.rollout.filter_hub.base_types import FilterOutput
-from miles.rollout.filter_hub.common_filters import REASON_ABORTED, REASON_KEPT, REASON_MISSING_REWARD, REASON_STALE
+from miles.rollout.filter_hub.common_filters import REASONS
 from miles.rollout.fully_async_data_buffer import DataBufferConstructorInput, DataBufferInput, DefaultDataBuffer
 from miles.rollout.never_give_up import (
     NGU_ATTEMPT_COUNT_KEY,
@@ -86,7 +86,7 @@ def _make_ngu(**overrides) -> tuple[NeverGiveUp, RolloutDataSourceWithBuffer]:
 def _offer(ngu: NeverGiveUp, group: list[Sample]) -> FilterOutput:
     """What a rollout does with a finished group: filter it, then tell the handler what became of it."""
     output = nonzero_std(ngu._args, group)
-    ngu(group, group=group, reason=REASON_KEPT if output.keep else output.reason)
+    ngu(group, group=group, reason=REASONS.kept if output.keep else output.reason)
     return output
 
 
@@ -186,7 +186,7 @@ class TestStaleGroups:
         merged = _group(7, [0.0, 0.0, 0.0, 1.0], first_index=100, version=1)
         assert _offer(ngu, merged).keep
 
-        ngu(merged, group=merged, reason=REASON_STALE)
+        ngu(merged, group=merged, reason=REASONS.stale)
 
         [retry] = source.get_samples(1)
         assert [sample.group_index for sample in retry] == [7] * GROUP_SIZE
@@ -196,7 +196,7 @@ class TestStaleGroups:
         ngu, source = _make_ngu(ngu_solved_reward=2.0)
         stale = _group(7, [0.0, 0.0, 0.0, 1.0], first_index=100, version=1)
         assert _offer(ngu, stale).keep
-        ngu(stale, group=stale, reason=REASON_STALE)
+        ngu(stale, group=stale, reason=REASONS.stale)
         retry = _answer(source.get_samples(1)[0], [0.0, 1.0, 0.0, 0.0], version=9)
 
         assert _offer(ngu, retry).keep
@@ -212,7 +212,7 @@ class TestStaleGroups:
         assert _offer(ngu, merged).keep and len(merged) == 2 * GROUP_SIZE
         merged[:] = merged[GROUP_SIZE:]  # the fully-async buffer pruned the older attempt on consume
 
-        ngu(merged, group=merged, reason=REASON_STALE)
+        ngu(merged, group=merged, reason=REASONS.stale)
         retry = _answer(source.get_samples(1)[0], [0.0, 1.0, 0.0, 0.0], version=9)
 
         assert _offer(ngu, retry).keep
@@ -222,7 +222,7 @@ class TestStaleGroups:
 
 
 class TestAbortedAndMissingReward:
-    @pytest.mark.parametrize("reason", [REASON_ABORTED, REASON_MISSING_REWARD])
+    @pytest.mark.parametrize("reason", [REASONS.aborted, REASONS.missing_reward])
     def test_a_failed_retry_is_requeued_as_it_was(self, reason):
         ngu, source = _make_ngu()
         _offer(ngu, _group(7, [0.0] * GROUP_SIZE, first_index=100))
@@ -235,7 +235,7 @@ class TestAbortedAndMissingReward:
         assert [sample.index for sample in requeued] != [sample.index for sample in retry]
         assert ngu._chains[7].attempt_count == 1  # nothing was learned from it
 
-    @pytest.mark.parametrize("reason", [REASON_ABORTED, REASON_MISSING_REWARD])
+    @pytest.mark.parametrize("reason", [REASONS.aborted, REASONS.missing_reward])
     def test_a_failed_first_attempt_is_dropped(self, reason):
         ngu, source = _make_ngu()
         group = _group(7, [0.0] * GROUP_SIZE)

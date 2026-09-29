@@ -32,7 +32,7 @@ from miles.rollout.base_types import (
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
 )
-from miles.rollout.filter_hub.common_filters import REASON_ABORTED, REASON_STALE
+from miles.rollout.filter_hub.common_filters import REASONS
 from miles.rollout.fully_async_data_buffer import (
     DataBuffer,
     DataBufferConstructorInput,
@@ -245,7 +245,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
 
     def _recycle_unfinished(self, prompt_group: list[Sample], *, reason: str | None = None, **_) -> None:
         """Recycle aborted and stale groups; groups the filters reject are dropped."""
-        if reason in (None, REASON_ABORTED, REASON_STALE):
+        if reason in (None, REASONS.aborted, REASONS.stale):
             self._recycle(prompt_group)
 
     def _recycle(self, prompt_group: list[Sample]) -> None:

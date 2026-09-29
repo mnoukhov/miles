@@ -17,8 +17,7 @@ from dataclasses import dataclass
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, iter_samples
 from miles.rollout.filter_hub.common_filters import (
-    REASON_KEPT,
-    REASON_STALE,
+    REASONS,
     GroupWeightVersionStats,
     apply_aborted_filter,
     apply_missing_reward_filter,
@@ -189,7 +188,7 @@ class DefaultDataBuffer(DataBuffer):
             self._unused_handler_fn(input.prompt_group, group=input.group, reason=output.reason)
             return False
         if self._never_give_up:
-            self._unused_handler_fn(input.prompt_group, group=input.group, reason=REASON_KEPT)
+            self._unused_handler_fn(input.prompt_group, group=input.group, reason=REASONS.kept)
         return True
 
     async def get(self, current_version: int | None = None, **_) -> DataBufferInput:
@@ -210,7 +209,7 @@ class DefaultDataBuffer(DataBuffer):
                     if self._args.max_weight_staleness is not None and staleness > self._args.max_weight_staleness:
                         logger.info(f"Filtered stale group ({staleness=} > max={self._args.max_weight_staleness})")
                         self._metric_stale_groups += 1
-                        self._unused_handler_fn(entry.prompt_group, group=entry.group, reason=REASON_STALE)
+                        self._unused_handler_fn(entry.prompt_group, group=entry.group, reason=REASONS.stale)
                         continue
                     self._metric_consumed_staleness.append(staleness)
                 self._record_selected_version_stats(version_stats, current_version)

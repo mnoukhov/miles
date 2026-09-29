@@ -32,13 +32,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from miles.rollout.filter_hub.common_filters import (
-    REASON_ABORTED,
-    REASON_KEPT,
-    REASON_MISSING_REWARD,
-    REASON_STALE,
-    group_weight_version_stats,
-)
+from miles.rollout.filter_hub.common_filters import REASONS, group_weight_version_stats
 from miles.utils.types import Sample
 
 if TYPE_CHECKING:  # a runtime import would be circular through miles.rollout.base_types
@@ -93,11 +87,11 @@ class NeverGiveUp:
 
     def __call__(self, prompt_group: list[Sample], *, group: list[Sample] | None = None, reason: str | None = None):
         group = prompt_group if group is None else group
-        if reason == REASON_KEPT:
+        if reason == REASONS.kept:
             self._merge_into_kept(group)
-        elif reason in (REASON_ABORTED, REASON_MISSING_REWARD):
+        elif reason in (REASONS.aborted, REASONS.missing_reward):
             self._retry_pending_chain(group)
-        elif reason == REASON_STALE:
+        elif reason == REASONS.stale:
             self._keep_going_after_stale(group)
         else:
             self._keep_going_or_drop(group)
