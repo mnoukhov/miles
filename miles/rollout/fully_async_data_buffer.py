@@ -11,11 +11,11 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from argparse import ArgumentParser, Namespace
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
-from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, iter_samples
+from miles.rollout.filter_hub.base_types import MetricGatherer, UnusedSamplesHandler, call_dynamic_filter, iter_samples
 from miles.rollout.filter_hub.common_filters import (
     REASONS,
     GroupWeightVersionStats,
@@ -67,8 +67,7 @@ def first_sample(group: Group) -> Sample:
 
 class DataBufferConstructorInput:
     args: Namespace
-    # --async-unused-samples-handler, applied to unused groups with the reason they are unused
-    unused_handler_fn: Callable[..., None]
+    unused_handler_fn: UnusedSamplesHandler  # --async-unused-samples-handler, told what became of each group
 
 
 @dataclass

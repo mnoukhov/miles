@@ -18,7 +18,6 @@ rollout engines, pausing producer submissions for the duration of the
 
 import asyncio
 import logging
-from collections.abc import Callable
 from dataclasses import replace
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
@@ -32,6 +31,7 @@ from miles.rollout.base_types import (
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
 )
+from miles.rollout.filter_hub.base_types import UnusedSamplesHandler
 from miles.rollout.filter_hub.common_filters import REASONS
 from miles.rollout.fully_async_data_buffer import (
     DataBuffer,
@@ -236,22 +236,26 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
 
         return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics(input.trainer_model_id))
 
-    def _make_unused_handler(self, name: str) -> Callable[..., None]:
+    def _make_unused_handler(self, name: str) -> UnusedSamplesHandler:
         if name == "never_give_up":
             return NeverGiveUp(self.args, data_source=self.data_source)
         if name == "retry":
             return self._recycle_unfinished
-        return lambda prompt_group, **_: None
+        return _drop_unused
 
-    def _recycle_unfinished(self, prompt_group: list[Sample], *, reason: str | None = None, **_) -> None:
+    def _recycle_unfinished(self, prompt_group: list[Sample], *, group: Group, reason: str | None) -> None:
         """Recycle aborted and stale groups; groups the filters reject are dropped."""
-        if reason in (None, REASONS.aborted, REASONS.stale):
+        if reason in (REASONS.aborted, REASONS.stale):
             self._recycle(prompt_group)
 
     def _recycle(self, prompt_group: list[Sample]) -> None:
         for sample in prompt_group:
             sample.reset_for_retry()
         self.data_source.add_samples([prompt_group])
+
+
+def _drop_unused(prompt_group: list[Sample], *, group: Group, reason: str | None) -> None:
+    """The ``drop`` handler."""
 
 
 async def _end_worker(worker: asyncio.Task) -> None:

@@ -2,6 +2,7 @@ import argparse
 from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Protocol
 
 from miles.utils.types import Sample
 
@@ -13,6 +14,19 @@ class FilterOutput:
 
 
 DynamicFilterOutput = FilterOutput
+
+
+class UnusedSamplesHandler(Protocol):
+    """The ``--async-unused-samples-handler`` contract: told what became of every finished group.
+
+    ``prompt_group`` is the resubmittable prompt, ``group`` the finished samples, and ``reason``
+    why the group is unused (``REASONS`` in ``common_filters.py``, or a dynamic filter's own
+    reason, ``None`` if it gave none).
+    """
+
+    def __call__(
+        self, prompt_group: list[Sample], *, group: list[Sample | list[Sample]], reason: str | None
+    ) -> None: ...
 
 
 def iter_samples(group: list[Sample | list[Sample]]) -> Iterator[Sample]:

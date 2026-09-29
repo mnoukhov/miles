@@ -84,8 +84,7 @@ class NeverGiveUp:
         self._rng = random.Random(args.rollout_seed)
         self._chains: dict[int, PendingChain] = {}
 
-    def __call__(self, prompt_group: list[Sample], *, group: list[Sample] | None = None, reason: str | None = None):
-        group = prompt_group if group is None else group
+    def __call__(self, prompt_group: list[Sample], *, group: list[Sample], reason: str | None) -> None:
         if reason == REASONS.kept:
             self._merge_into_kept(group)
         elif reason in (REASONS.aborted, REASONS.missing_reward):

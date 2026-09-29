@@ -8,7 +8,7 @@ from packaging.version import parse
 from tqdm import tqdm
 
 from miles.rollout.base_types import RolloutFnTrainOutput
-from miles.rollout.filter_hub.base_types import MetricGatherer
+from miles.rollout.filter_hub.base_types import MetricGatherer, UnusedSamplesHandler
 from miles.rollout.filter_hub.common_filters import REASONS, apply_preput_filters
 from miles.rollout.generate_utils.prefill_logprobs import recompute_samples_rollout_logprobs_via_prefill
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
@@ -95,7 +95,7 @@ async def generate_rollout_async(
     state: GenerateState,
     rollout_id: int,
     data_source: Callable[[int], list[list[Sample]]],
-    handle_unused: Callable[..., None] | None = None,
+    handle_unused: UnusedSamplesHandler | None = None,
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     args = state.args
     assert args.rollout_global_dataset
