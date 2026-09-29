@@ -26,13 +26,12 @@ A port of allenai/open-instruct#1861.
 
 import copy
 import random
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
 
-from miles.rollout.filter_hub.common_filters import REASONS, group_weight_version_stats
+from miles.rollout.filter_hub.common_filters import REASONS, group_staleness, group_weight_version_stats
 from miles.utils.types import Sample
 
 if TYPE_CHECKING:  # a runtime import would be circular through miles.rollout.base_types
@@ -195,13 +194,18 @@ def make_retry_group(retry_template: Sample, *, sample_indices: list[int]) -> li
 
 
 def prune_stale_attempts(
-    group: list[Sample], *, attempt_size: int, is_stale: Callable[[list[Sample]], bool]
+    group: list[Sample], *, attempt_size: int, current_version: int | None, max_staleness: int | None
 ) -> list[Sample]:
-    """Drop the buffered attempts of a merged group that became too stale while it waited to be
-    trained on. The kept attempt (the last one) always stays, and the chain-wide baseline on the
-    samples still counts the dropped attempts' rewards."""
-    if len(group) == attempt_size:
+    """Drop the buffered attempts of a merged group that became more than ``max_staleness`` weight
+    versions old while it waited to be trained on. The kept attempt (the last one) always stays,
+    and the chain-wide baseline on the samples still counts the dropped attempts' rewards."""
+    if max_staleness is None or len(group) == attempt_size:
         return group
+
+    def is_stale(attempt: list[Sample]) -> bool:
+        staleness = group_staleness(attempt, current_version)
+        return staleness is not None and staleness > max_staleness
+
     attempts = _split_attempts(group, attempt_size=attempt_size)
     kept = [attempt for attempt in attempts[:-1] if not is_stale(attempt)]
     return [sample for attempt in [*kept, attempts[-1]] for sample in attempt]

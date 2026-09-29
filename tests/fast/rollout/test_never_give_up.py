@@ -253,15 +253,18 @@ class TestHelpers:
 
     def test_prune_keeps_fresh_attempts_and_always_the_kept_one(self):
         stale, fresh, kept = (
-            _group(7, [0.0] * 2),
-            _group(7, [0.0] * 2, first_index=2),
-            _group(7, [1.0, 0.0], first_index=4),
+            _group(7, [0.0] * 2, version=1),
+            _group(7, [0.0] * 2, first_index=2, version=4),
+            _group(7, [1.0, 0.0], first_index=4, version=1),
         )
-        pruned = prune_stale_attempts(
-            [*stale, *fresh, *kept], attempt_size=2, is_stale=lambda attempt: attempt[0] in (stale[0], kept[0])
-        )
+        pruned = prune_stale_attempts([*stale, *fresh, *kept], attempt_size=2, current_version=5, max_staleness=2)
 
         assert [sample.index for sample in pruned] == [2, 3, 4, 5]
+
+    def test_prune_without_a_staleness_bound_keeps_everything(self):
+        group = [*_group(7, [0.0] * 2, version=1), *_group(7, [1.0, 0.0], first_index=2, version=9)]
+
+        assert prune_stale_attempts(group, attempt_size=2, current_version=99, max_staleness=None) == group
 
     def test_anchor_keeps_positives_and_sums_to_zero(self):
         rewards = torch.tensor([0.0, 0.0, 0.0, 1.0])

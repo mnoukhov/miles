@@ -201,7 +201,12 @@ class DefaultDataBuffer(DataBuffer):
                 entry = self._buffer.pop(0)
                 self._cond.notify_all()  # wake producers blocked on a full buffer
                 if self._never_give_up:
-                    entry.group = self._prune_stale_never_give_up_attempts(entry.group, current_version)
+                    entry.group = prune_stale_attempts(
+                        entry.group,
+                        attempt_size=self._args.n_samples_per_prompt,
+                        current_version=current_version,
+                        max_staleness=self._args.max_weight_staleness,
+                    )
 
                 version_stats = group_weight_version_stats(entry.group)
                 staleness = version_stats.oldest_lag(current_version)
@@ -214,19 +219,6 @@ class DefaultDataBuffer(DataBuffer):
                     self._metric_consumed_staleness.append(staleness)
                 self._record_selected_version_stats(version_stats, current_version)
                 return entry
-
-    def _prune_stale_never_give_up_attempts(self, group: Group, current_version: int | None) -> Group:
-        """A never_give_up group merges older attempts at its prompt, so staleness is judged on the
-        kept attempt alone: buffered attempts beyond --max-weight-staleness are dropped first."""
-        max_staleness = self._args.max_weight_staleness
-        if max_staleness is None:
-            return group
-
-        def is_stale(attempt: list[Sample]) -> bool:
-            staleness = group_staleness(attempt, current_version)
-            return staleness is not None and staleness > max_staleness
-
-        return prune_stale_attempts(group, attempt_size=self._args.n_samples_per_prompt, is_stale=is_stale)
 
     def _record_selected_version_stats(
         self,
