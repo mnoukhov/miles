@@ -20,7 +20,7 @@ class UnusedSamplesHandler(Protocol):
     """The ``--async-unused-samples-handler`` contract: told what became of every finished group.
 
     ``prompt_group`` is the resubmittable prompt, ``group`` the finished samples, and ``reason``
-    why the group is unused (``REASONS`` in ``common_filters.py``, or a dynamic filter's own
+    why the group is unused (``FilterReason`` in ``common_filters.py``, or a dynamic filter's own
     reason, ``None`` if it gave none).
     """
 

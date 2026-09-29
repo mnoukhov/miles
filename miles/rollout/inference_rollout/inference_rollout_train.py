@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from miles.rollout.base_types import RolloutFnTrainOutput
 from miles.rollout.filter_hub.base_types import MetricGatherer, UnusedSamplesHandler
-from miles.rollout.filter_hub.common_filters import REASONS, apply_preput_filters
+from miles.rollout.filter_hub.common_filters import FilterReason, apply_preput_filters
 from miles.rollout.generate_utils.prefill_logprobs import recompute_samples_rollout_logprobs_via_prefill
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
@@ -160,7 +160,7 @@ async def generate_rollout_async(
             # NOTE: here we have not stored all the unused samples back to the data buffer.
             if len(data) < target_data_size:
                 if isinstance(handle_unused, NeverGiveUp):
-                    handle_unused(group, group=group, reason=REASONS.kept)
+                    handle_unused(group, group=group, reason=FilterReason.kept)
                 data.append(group)
                 pbar.update(len(group))
 

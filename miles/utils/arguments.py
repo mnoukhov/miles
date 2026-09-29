@@ -66,25 +66,20 @@ def resolve_rollout_function_paths(args) -> tuple[str, str]:
 
 
 def _validate_never_give_up_args(args) -> None:
+    if args.async_unused_samples_handler != "never_give_up":
+        return
     assert (
         0.0 <= args.ngu_requeue_probability <= 1.0
     ), f"--ngu-requeue-probability must be in [0, 1], got {args.ngu_requeue_probability}"
-    if args.async_unused_samples_handler != "never_give_up":
-        return
     assert (
         args.dynamic_sampling_filter_path is not None
     ), "never_give_up retries groups the dynamic sampling filter rejects; set --dynamic-sampling-filter-path"
     assert (
         not use_legacy_rollout_v1()
-    ), "never_give_up needs the class-based rollout; unset MILES_USE_LEGACY_ROLLOUT_V1"
-    assert (
-        args.rollout_function_path is None
-    ), "never_give_up is implemented in the default and --fully-async rollout functions only"
-    if args.fully_async:
-        assert (
-            args.custom_async_data_buffer_path is None
-            and getattr(args, "custom_async_data_buffer_path_per_model", None) is None
-        ), "never_give_up runs in the default fully-async data buffer; drop --custom-async-data-buffer-path"
+        and args.rollout_function_path is None
+        and args.custom_async_data_buffer_path is None
+        and getattr(args, "custom_async_data_buffer_path_per_model", None) is None
+    ), "never_give_up is implemented in the default rollout functions and fully-async data buffer only"
     assert not args.partial_rollout, "never_give_up does not support --partial-rollout"
     # Merged groups make the sample count vary, and trimming it to --global-batch-size could split one.
     assert args.use_dynamic_global_batch_size, "never_give_up requires --use-dynamic-global-batch-size"
@@ -841,9 +836,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "With --async-unused-samples-handler never_give_up (Never Give Up, NGU): probability in "
                     "[0, 1] that an unsolved prompt group rejected by --dynamic-sampling-filter-path is requeued "
-                    "for another attempt instead of dropped. Earlier attempts are buffered until an attempt's "
-                    "max reward beats the best so far; then all attempts train together as one group, with the "
-                    "mean reward over the whole chain of attempts as the baseline."
+                    "for another attempt instead of dropped. Earlier attempts are buffered until the filter keeps "
+                    "one; then the attempts at most --max-weight-staleness versions old train together as one "
+                    "group, with the mean reward over the whole chain of attempts as the baseline."
                 ),
             )
             parser.add_argument(
@@ -897,9 +892,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Maximum allowed gap between a group's oldest weight version and the current "
                     "engine weight version. Groups exceeding this threshold are recycled back to "
                     "the data buffer instead of being sent to training. Only effective in fully "
-                    "async mode, except that the never_give_up handler also uses it to drop buffered attempts that "
-                    "are too old to train alongside the accepted one. None (default) disables staleness "
-                    "filtering."
+                    "async mode. None (default) disables staleness filtering."
                 ),
             )
             parser.add_argument(
@@ -931,13 +924,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 choices=["retry", "drop", "never_give_up"],
                 default="drop",
                 help=(
-                    "What to do with a finished group that is not trained on, given the reason "
-                    "(aborted, missing reward, rejected by --dynamic-sampling-filter-path, or, in fully "
-                    "async mode, beyond --max-weight-staleness): drop (default) discards the group; retry "
-                    "recycles the prompts of aborted and stale groups into the data source for regeneration "
-                    "(fully async mode only); never_give_up keeps retrying the prompts, merging earlier "
-                    "attempts into the group that finally trains (see --ngu-requeue-probability and "
-                    "--ngu-solved-reward)."
+                    "What to do with a finished group fully async mode does not train on "
+                    "(aborted, or beyond --max-weight-staleness): drop "
+                    "(default) discards the group; retry recycles its prompts into the data "
+                    "source for regeneration. Groups rejected by "
+                    "--dynamic-sampling-filter-path are dropped, except by never_give_up, which retries "
+                    "them in any rollout mode (see --ngu-requeue-probability)."
                 ),
             )
             parser.add_argument(

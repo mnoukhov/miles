@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
 from miles.rollout.filter_hub.base_types import MetricGatherer, UnusedSamplesHandler, call_dynamic_filter, iter_samples
 from miles.rollout.filter_hub.common_filters import (
-    REASONS,
+    FilterReason,
     GroupWeightVersionStats,
     apply_aborted_filter,
     apply_missing_reward_filter,
@@ -67,7 +67,7 @@ def first_sample(group: Group) -> Sample:
 
 class DataBufferConstructorInput:
     args: Namespace
-    unused_handler_fn: UnusedSamplesHandler  # --async-unused-samples-handler, told what became of each group
+    unused_handler_fn: UnusedSamplesHandler  # --async-unused-samples-handler, applied to unused groups
 
 
 @dataclass
@@ -124,11 +124,9 @@ class DefaultDataBuffer(DataBuffer):
         floor(factor * rollout_batch_size) groups; when full, put blocks until
         training consumes.
     (2) unused handling: ``--async-unused-samples-handler`` decides what happens
-        to unused groups, and is told why each is unused: drop discards them,
-        retry recycles the prompts of aborted and stale groups for regeneration,
-        never_give_up keeps retrying the prompts of every kind and merges kept
-        groups with their earlier attempts (see ``never_give_up.py``). Missing-reward and custom-filter rejections are
-        otherwise discarded.
+        to aborted and stale groups: drop discards them, retry recycles their
+        prompts for regeneration. Missing-reward and custom-filter rejections
+        are discarded directly, except by never_give_up (see ``never_give_up.py``).
     """
 
     def __init__(self, input: DataBufferConstructorInput):
@@ -187,7 +185,7 @@ class DefaultDataBuffer(DataBuffer):
             self._unused_handler_fn(input.prompt_group, group=input.group, reason=output.reason)
             return False
         if self._never_give_up:
-            self._unused_handler_fn(input.prompt_group, group=input.group, reason=REASONS.kept)
+            self._unused_handler_fn(input.prompt_group, group=input.group, reason=FilterReason.kept)
         return True
 
     async def get(self, current_version: int | None = None, **_) -> DataBufferInput:
@@ -213,7 +211,7 @@ class DefaultDataBuffer(DataBuffer):
                     if self._args.max_weight_staleness is not None and staleness > self._args.max_weight_staleness:
                         logger.info(f"Filtered stale group ({staleness=} > max={self._args.max_weight_staleness})")
                         self._metric_stale_groups += 1
-                        self._unused_handler_fn(entry.prompt_group, group=entry.group, reason=REASONS.stale)
+                        self._unused_handler_fn(entry.prompt_group, group=entry.group, reason=FilterReason.stale)
                         continue
                     self._metric_consumed_staleness.append(staleness)
                 self._record_selected_version_stats(version_stats, current_version)

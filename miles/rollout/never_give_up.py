@@ -31,7 +31,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from miles.rollout.filter_hub.common_filters import REASONS, group_staleness, group_weight_version_stats
+from miles.rollout.filter_hub.base_types import UnusedSamplesHandler
+from miles.rollout.filter_hub.common_filters import FilterReason, group_staleness, group_weight_version_stats
 from miles.utils.types import Sample
 
 if TYPE_CHECKING:  # a runtime import would be circular through miles.rollout.base_types
@@ -39,8 +40,7 @@ if TYPE_CHECKING:  # a runtime import would be circular through miles.rollout.ba
 
 NGU_BASELINE_REWARD_SUM_KEY = "ngu_baseline_reward_sum"
 NGU_BASELINE_SAMPLE_COUNT_KEY = "ngu_baseline_sample_count"
-NGU_ATTEMPT_COUNT_KEY = "ngu_attempt_count"
-_NGU_METADATA_KEYS = (NGU_BASELINE_REWARD_SUM_KEY, NGU_BASELINE_SAMPLE_COUNT_KEY, NGU_ATTEMPT_COUNT_KEY)
+_NGU_METADATA_KEYS = (NGU_BASELINE_REWARD_SUM_KEY, NGU_BASELINE_SAMPLE_COUNT_KEY)
 
 
 @dataclass
@@ -48,29 +48,13 @@ class PendingChain:
     """Everything buffered for one prompt while NGU keeps retrying it."""
 
     retry_template: Sample
-    # None right after a stale reset.
-    best_reward: float | None = None
-    # Buffered attempts (n_samples_per_prompt samples each) with the weight version they were generated at.
-    attempts: list[tuple[int | None, list[Sample]]] = field(default_factory=list)
-    sample_count: int = 0
+    best_reward: float | None = None  # None right after a stale reset
+    samples: list[Sample] = field(default_factory=list)  # buffered attempts, n_samples_per_prompt each
     reward_sum: float = 0.0
-    attempt_count: int = 0
-
-    def record(
-        self,
-        attempts: list[list[Sample]],
-        *,
-        reward_sum: float,
-        sample_count: int,
-        attempt_count: int,
-    ) -> None:
-        self.attempts.extend((_weight_version(attempt), attempt) for attempt in attempts)
-        self.reward_sum += reward_sum
-        self.sample_count += sample_count
-        self.attempt_count += attempt_count
+    sample_count: int = 0
 
 
-class NeverGiveUp:
+class NeverGiveUp(UnusedSamplesHandler):
     """The ``never_give_up`` unused-samples handler.
 
     A kept group is replaced in place by the merged chain, so callers train on whatever ``group``
@@ -85,11 +69,11 @@ class NeverGiveUp:
         self._chains: dict[int, PendingChain] = {}
 
     def __call__(self, prompt_group: list[Sample], *, group: list[Sample], reason: str | None) -> None:
-        if reason == REASONS.kept:
+        if reason == FilterReason.kept:
             self._merge_into_kept(group)
-        elif reason in (REASONS.aborted, REASONS.missing_reward):
+        elif reason in (FilterReason.aborted, FilterReason.missing_reward):
             self._retry_pending_chain(group)
-        elif reason == REASONS.stale:
+        elif reason == FilterReason.stale:
             self._keep_going_after_stale(group)
         else:
             self._keep_going_or_drop(group)
@@ -103,8 +87,21 @@ class NeverGiveUp:
                 self._requeue(pending.retry_template)
 
     def _merge_into_kept(self, group: list[Sample]) -> None:
-        pending = self._chains.pop(group[0].group_index, None)
-        group[:] = self._merge_chain(pending, group=group, rewards=_rewards(self._args, group))
+        """Replace the kept group with the chain's fresh-enough buffered attempts plus itself, each
+        sample carrying the chain-wide baseline."""
+        pending = self._chains.pop(group[0].group_index, None) or PendingChain(retry_template=group[0])
+        merged = prune_stale_attempts(
+            pending.samples + group,
+            attempt_size=self._args.n_samples_per_prompt,
+            current_version=group_weight_version_stats(group).newest_version,
+            max_staleness=self._args.max_weight_staleness,
+        )
+        reward_sum = pending.reward_sum + sum(_rewards(self._args, group))
+        for sample in merged:
+            sample.group_index = group[0].group_index
+            sample.metadata[NGU_BASELINE_REWARD_SUM_KEY] = reward_sum
+            sample.metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] = pending.sample_count + len(group)
+        group[:] = merged
 
     def _retry_pending_chain(self, group: list[Sample]) -> None:
         if (pending := self._chains.get(group[0].group_index)) is not None:
@@ -114,13 +111,9 @@ class NeverGiveUp:
         """A stale accepted attempt failed to train, but its rewards still shape the baseline."""
         pending = self._chains.get(group[0].group_index) or PendingChain(retry_template=group[0])
         metadata = group[0].metadata
-        rewards = _rewards(self._args, group)
-        pending.record(
-            _split_attempts(group, attempt_size=self._args.n_samples_per_prompt),
-            reward_sum=metadata.get(NGU_BASELINE_REWARD_SUM_KEY, sum(rewards)),
-            sample_count=metadata.get(NGU_BASELINE_SAMPLE_COUNT_KEY, len(group)),
-            attempt_count=metadata.get(NGU_ATTEMPT_COUNT_KEY, 1),
-        )
+        pending.samples.extend(group)
+        pending.reward_sum += metadata.get(NGU_BASELINE_REWARD_SUM_KEY, sum(_rewards(self._args, group)))
+        pending.sample_count += metadata.get(NGU_BASELINE_SAMPLE_COUNT_KEY, len(group))
         pending.best_reward = None
         self._chains[group[0].group_index] = pending
         self._requeue(pending.retry_template)
@@ -133,7 +126,9 @@ class NeverGiveUp:
         if best_reward >= self._args.ngu_solved_reward or self._rng.random() >= self._args.ngu_requeue_probability:
             return
 
-        pending.record([group], reward_sum=sum(rewards), sample_count=len(group), attempt_count=1)
+        pending.samples.extend(group)
+        pending.reward_sum += sum(rewards)
+        pending.sample_count += len(group)
         pending.best_reward = best_reward
         self._chains[chain_id] = pending
         self._requeue(pending.retry_template)
@@ -141,29 +136,6 @@ class NeverGiveUp:
     def _requeue(self, retry_template: Sample) -> None:
         sample_indices = self._data_source.reserve_sample_indices(self._args.n_samples_per_prompt)
         self._data_source.add_samples([make_retry_group(retry_template, sample_indices=sample_indices)])
-
-    def _merge_chain(self, pending: PendingChain | None, *, group: list[Sample], rewards: list[float]) -> list[Sample]:
-        """The chain's fresh-enough buffered attempts plus the kept one, each sample carrying the
-        chain-wide baseline."""
-        pending = pending or PendingChain(retry_template=group[0])
-        version = _weight_version(group)
-        max_staleness = self._args.max_weight_staleness
-        merged = [
-            sample
-            for attempt_version, attempt in pending.attempts
-            if max_staleness is None
-            or version is None
-            or attempt_version is None
-            or version - attempt_version <= max_staleness
-            for sample in attempt
-        ]
-        merged.extend(group)
-        for sample in merged:
-            sample.group_index = group[0].group_index
-            sample.metadata[NGU_BASELINE_REWARD_SUM_KEY] = pending.reward_sum + sum(rewards)
-            sample.metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] = pending.sample_count + len(group)
-            sample.metadata[NGU_ATTEMPT_COUNT_KEY] = pending.attempt_count + 1
-        return merged
 
 
 def _rewards(args, group: list[Sample]) -> list[float]:
@@ -174,10 +146,6 @@ def _split_attempts(group: list[Sample], *, attempt_size: int) -> list[list[Samp
     return [group[start : start + attempt_size] for start in range(0, len(group), attempt_size)]
 
 
-def _weight_version(group: list[Sample]) -> int | None:
-    return group_weight_version_stats(group).newest_version
-
-
 def make_retry_group(retry_template: Sample, *, sample_indices: list[int]) -> list[Sample]:
     """Fresh copies of a chain's prompt. They keep its ``group_index`` so the retry stays on the chain."""
     group = []
@@ -186,7 +154,6 @@ def make_retry_group(retry_template: Sample, *, sample_indices: list[int]) -> li
         sample.reset_for_retry()
         for key in _NGU_METADATA_KEYS:
             sample.metadata.pop(key, None)
-        sample.status = Sample.Status.PENDING
         sample.index = index
         group.append(sample)
     return group

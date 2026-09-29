@@ -117,9 +117,8 @@ def validate_multi_policy_args(args, *, megatron_config: MegatronConfig) -> None
         "trainer, while every policy still asks for a slice of its own"
     )
     assert args.async_unused_samples_handler not in ("retry", "never_give_up"), (
-        "multi policy training does not support --async-unused-samples-handler retry or never_give_up: one "
-        "generate call feeds every policy, so recycling its prompts for one of them regenerates the data of "
-        "all the others"
+        "multi policy training does not support --async-unused-samples-handler retry or never_give_up: one generate call feeds "
+        "every policy, so recycling its prompts for one of them regenerates the data of all the others"
     )
     assert (
         args.ckpt_step is None

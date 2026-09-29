@@ -31,8 +31,7 @@ from miles.rollout.base_types import (
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
 )
-from miles.rollout.filter_hub.base_types import UnusedSamplesHandler
-from miles.rollout.filter_hub.common_filters import REASONS
+from miles.rollout.filter_hub.common_filters import FilterReason
 from miles.rollout.fully_async_data_buffer import (
     DataBuffer,
     DataBufferConstructorInput,
@@ -75,8 +74,12 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         # default to sample level backfill for fully async rollout
         self._scheduler = make_submission_scheduler(input.args, default="sample")
         assert input.args.async_unused_samples_handler in ("retry", "drop", "never_give_up")
-        # applied to every group we do not train on, with the reason it is unused
-        self._handle_unused = self._make_unused_handler(input.args.async_unused_samples_handler)
+        # applied to every group we do not train on; "drop" discards instead of recycling
+        self._handle_unused = (
+            self._recycle if input.args.async_unused_samples_handler == "retry" else (lambda prompt_group, **_: None)
+        )
+        if input.args.async_unused_samples_handler == "never_give_up":
+            self._handle_unused = NeverGiveUp(input.args, data_source=self.data_source)
         self._sample_filter = load_function(input.args.rollout_sample_filter_path)
         self._worker: asyncio.Task | None = None
         self._eval_prompt_dataset_cache: dict = {}
@@ -236,26 +239,13 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
 
         return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics(input.trainer_model_id))
 
-    def _make_unused_handler(self, name: str) -> UnusedSamplesHandler:
-        if name == "never_give_up":
-            return NeverGiveUp(self.args, data_source=self.data_source)
-        if name == "retry":
-            return self._recycle_unfinished
-        return _drop_unused
-
-    def _recycle_unfinished(self, prompt_group: list[Sample], *, group: Group, reason: str | None) -> None:
+    def _recycle(self, prompt_group: list[Sample], *, group: Group, reason: str | None) -> None:
         """Recycle aborted and stale groups; groups the filters reject are dropped."""
-        if reason in (REASONS.aborted, REASONS.stale):
-            self._recycle(prompt_group)
-
-    def _recycle(self, prompt_group: list[Sample]) -> None:
+        if reason not in (FilterReason.aborted, FilterReason.stale):
+            return
         for sample in prompt_group:
             sample.reset_for_retry()
         self.data_source.add_samples([prompt_group])
-
-
-def _drop_unused(prompt_group: list[Sample], *, group: Group, reason: str | None) -> None:
-    """The ``drop`` handler."""
 
 
 async def _end_worker(worker: asyncio.Task) -> None:
