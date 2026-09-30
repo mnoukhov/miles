@@ -17,11 +17,9 @@ from miles.rollout.base_types import (
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
 )
-from miles.rollout.filter_hub.base_types import drop_unused
 from miles.rollout.generate_hub.single_turn import generate
 from miles.rollout.generate_utils.generate_endpoint_utils import policy_uses_routing_key
 from miles.rollout.inference_rollout.compatibility import load_generate_function
-from miles.rollout.never_give_up import NeverGiveUp
 from miles.rollout.rm_hub import async_rm, batched_async_rm
 from miles.utils.lifecycle import TrajectoryLifecycle
 from miles.utils.processing_utils import load_processor, load_tokenizer
@@ -212,12 +210,6 @@ class InferenceRolloutFn(BaseRolloutFn):
     def __init__(self, input: RolloutFnConstructorInput):
         super().__init__(input)
         self.data_source = input.data_source
-        # Stateful across rollouts: it holds the prompts it keeps retrying.
-        self.never_give_up = (
-            NeverGiveUp(input.args, data_source=self.data_source)
-            if input.args.async_unused_samples_handler == "never_give_up"
-            else None
-        )
         self.state = GenerateState(input.args)
         self.eval_prompt_dataset_cache = {}
 
@@ -230,11 +222,9 @@ class InferenceRolloutFn(BaseRolloutFn):
         from miles.rollout.inference_rollout.inference_rollout_train import generate_rollout_async
 
         output, aborted_samples = await generate_rollout_async(
-            self.state, input.rollout_id, self.data_source.get_samples, handle_unused=self.never_give_up or drop_unused
+            self.state, input.rollout_id, self.data_source.get_samples
         )
         self.data_source.add_samples(aborted_samples)
-        if self.never_give_up is not None:
-            self.never_give_up.requeue_lost_retries()
         return output
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnEvalOutput:

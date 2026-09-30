@@ -8,7 +8,6 @@ from argparse import Namespace
 import pytest
 import torch
 
-import miles.rollout.inference_rollout.inference_rollout_train as train
 from miles.rollout.data_source import RolloutDataSourceWithBuffer
 from miles.rollout.filter_hub.base_types import FilterOutput
 from miles.rollout.filter_hub.common_filters import FilterReason
@@ -156,17 +155,6 @@ class TestNeverGiveUp:
         assert [sample.index for sample in retry] == [0, 1, 2, 3]
         assert retry[0].metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] == 2 * GROUP_SIZE
 
-    def test_lost_retries_are_requeued(self):
-        ngu, source = _make_ngu()
-        _offer(ngu, _group(7, [0.0] * GROUP_SIZE, first_index=100))
-        source.get_samples(1)  # the retry is drawn, then lost (e.g. aborted at the end of a rollout)
-
-        ngu.requeue_lost_retries()
-
-        assert [group[0].group_index for group in source.buffer] == [7]
-        ngu.requeue_lost_retries()  # already buffered, so not requeued twice
-        assert len(source.buffer) == 1
-
 
 class TestStaleGroups:
     def test_a_stale_group_keeps_going_and_its_retry_trains_with_its_completions_merged_back(self):
@@ -252,60 +240,6 @@ class TestHelpers:
         assert torch.equal(anchor_positive_advantages(advantages, torch.tensor([1.0, 1.0])), advantages)
 
 
-class TestGenerateRolloutWithNeverGiveUp:
-    def test_retried_prompt_trains_as_one_merged_group(self, monkeypatch):
-        """Chain 0 has no signal on its first attempt and solves one sample on its retry."""
-        args = _args(
-            rollout_global_dataset=True,
-            rollout_batch_size=2,
-            over_sampling_batch_size=1,
-            rollout_submission_granularity=None,
-            rollout_sample_filter_path=None,
-            rollout_all_samples_process_path=None,
-            sglang_router_ip="127.0.0.1",
-            sglang_router_port=30000,
-            partial_rollout=False,
-        )
-        source = RolloutDataSourceWithBuffer(_args())
-        ngu = NeverGiveUp(args, data_source=source)
-        attempts_of_chain: dict[int, int] = {}
-
-        async def generate(group):
-            attempt = attempts_of_chain.get(group[0].group_index, 0)
-            attempts_of_chain[group[0].group_index] = attempt + 1
-            no_signal = group[0].group_index == 0 and attempt == 0
-            return _answer(group, [0.0] * GROUP_SIZE if no_signal else [1.0, 0.0, 0.0, 0.0])
-
-        async def fake_abort(_state, pendings, _rollout_id):
-            for task in pendings:
-                task.cancel()
-            await asyncio.gather(*pendings, return_exceptions=True)
-            return []
-
-        async def noop(*_args, **_kwargs):
-            return None
-
-        state = Namespace(args=args, sampling_params={}, aborted=False, reset=lambda: None)
-        monkeypatch.setattr(
-            train,
-            "submit_generate_tasks",
-            lambda _state, samples, sample_done_callback=None: [asyncio.ensure_future(generate(g)) for g in samples],
-        )
-        monkeypatch.setattr(train, "abort", fake_abort)
-        monkeypatch.setattr(
-            train, "load_function", lambda path: nonzero_std if path == args.dynamic_sampling_filter_path else None
-        )
-        monkeypatch.setattr(train.dumper_utils, "configure_sglang", noop)
-        monkeypatch.setattr(train, "recompute_samples_rollout_logprobs_via_prefill", noop)
-
-        output, _ = asyncio.run(train.generate_rollout_async(state, 0, source.get_samples, handle_unused=ngu))
-
-        groups = {group[0].group_index: group for group in output.samples}
-        assert len(groups[0]) == 2 * GROUP_SIZE
-        assert groups[0][0].metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] == 2 * GROUP_SIZE
-        assert output.metrics["rollout/dynamic_filter/drop_zero_std"] == 1
-
-
 class TestFullyAsyncDataBufferWithNeverGiveUp:
     @staticmethod
     def _buffer(**overrides):
@@ -379,7 +313,7 @@ class TestValidateNeverGiveUpArgs:
             async_unused_samples_handler="never_give_up",
             ngu_requeue_probability=0.5,
             dynamic_sampling_filter_path="miles.rollout.filter_hub.common_filters.apply_reward_nonzero_std_filter",
-            rollout_function_path=None,
+            fully_async=True,
             partial_rollout=False,
             use_dynamic_global_batch_size=True,
             custom_async_data_buffer_path=None,
@@ -399,7 +333,7 @@ class TestValidateNeverGiveUpArgs:
         [
             dict(ngu_requeue_probability=1.5),
             dict(dynamic_sampling_filter_path=None),
-            dict(rollout_function_path="my.rollout"),
+            dict(fully_async=False),
             dict(custom_async_data_buffer_path="my.Buffer"),
             dict(partial_rollout=True),
             dict(use_dynamic_global_batch_size=False),

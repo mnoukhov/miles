@@ -74,12 +74,11 @@ def _validate_never_give_up_args(args) -> None:
     assert (
         args.dynamic_sampling_filter_path is not None
     ), "never_give_up retries groups the dynamic sampling filter rejects; set --dynamic-sampling-filter-path"
+    assert args.fully_async, "never_give_up runs in --fully-async mode only"
     assert (
-        not use_legacy_rollout_v1()
-        and args.rollout_function_path is None
-        and args.custom_async_data_buffer_path is None
+        args.custom_async_data_buffer_path is None
         and getattr(args, "custom_async_data_buffer_path_per_model", None) is None
-    ), "never_give_up is implemented in the default rollout functions and fully-async data buffer only"
+    ), "never_give_up runs in the default fully-async data buffer; drop --custom-async-data-buffer-path"
     assert not args.partial_rollout, "never_give_up does not support --partial-rollout"
     # Merged groups make the sample count vary, and trimming it to --global-batch-size could split one.
     assert args.use_dynamic_global_batch_size, "never_give_up requires --use-dynamic-global-batch-size"
@@ -929,7 +928,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "(default) discards the group; retry recycles its prompts into the data "
                     "source for regeneration. Groups rejected by "
                     "--dynamic-sampling-filter-path are dropped, except by never_give_up, which retries "
-                    "them in any rollout mode (see --ngu-requeue-probability)."
+                    "them (see --ngu-requeue-probability)."
                 ),
             )
             parser.add_argument(
