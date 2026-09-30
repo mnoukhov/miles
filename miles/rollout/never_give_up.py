@@ -183,30 +183,29 @@ def prune_stale_attempts(
 
 
 def chain_rewards_and_std(
-    group_samples: list[Sample], rewards: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+    group_samples: list[Sample], rewards: torch.Tensor, std: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     """The rewards and reward std a group's GRPO step should use.
 
     For a merged never_give_up group the rewards below the group max are shifted by one amount so
     the group's mean becomes the chain baseline ``b`` (mean reward over every attempt in the chain,
     stale-pruned ones included), and the std is the chain's std around ``b``. The shift is skipped
-    when it would lift a negative to the max. Any other group is returned as is, with no std (the
-    caller computes its own).
+    when it would lift a negative to the max. Any other group keeps its ``rewards`` and ``std``.
     """
     metadata = group_samples[0].metadata
     if NGU_BASELINE_SAMPLE_COUNT_KEY not in metadata:
-        return rewards, None
+        return rewards, std
 
     count = metadata[NGU_BASELINE_SAMPLE_COUNT_KEY]
     baseline = metadata[NGU_BASELINE_REWARD_SUM_KEY] / count
     variance = (metadata[NGU_BASELINE_REWARD_SQ_SUM_KEY] - count * baseline**2) / max(count - 1, 1)
-    std = torch.tensor(max(variance, 0.0) ** 0.5)
+    chain_std = torch.tensor(max(variance, 0.0) ** 0.5)
 
     is_negative = rewards < rewards.max()
     if not bool(is_negative.any()):
-        return rewards, std
+        return rewards, chain_std
     shifted = rewards.clone()
     shifted[is_negative] += (len(rewards) * baseline - rewards.sum()) / is_negative.sum()
     if shifted[is_negative].max() >= rewards.max():  # a negative would overtake the max: skip the shift
-        return rewards, std
-    return shifted, std
+        return rewards, chain_std
+    return shifted, chain_std

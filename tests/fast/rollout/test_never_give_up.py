@@ -235,7 +235,7 @@ class TestHelpers:
             ngu_baseline_reward_sum=1.0, ngu_baseline_reward_sq_sum=1.0, ngu_baseline_sample_count=8
         )
 
-        rewards, std = chain_rewards_and_std(group, torch.tensor([1.0, 0.0, 0.0, 0.0]))
+        rewards, std = chain_rewards_and_std(group, torch.tensor([1.0, 0.0, 0.0, 0.0]), torch.tensor(0.5))
 
         assert rewards.tolist() == pytest.approx([1.0, -1 / 6, -1 / 6, -1 / 6])
         assert float(rewards.mean()) == pytest.approx(0.125)
@@ -248,11 +248,12 @@ class TestHelpers:
         )
         rewards = torch.tensor([0.6, 0.2, 0.0, 0.0])
 
-        assert torch.equal(chain_rewards_and_std(group, rewards)[0], rewards)
+        assert torch.equal(chain_rewards_and_std(group, rewards, rewards.std())[0], rewards)
 
     def test_a_group_without_chain_stats_is_left_alone(self):
         rewards = torch.tensor([1.0, 0.0])
-        assert chain_rewards_and_std(_group(7, [1.0, 0.0]), rewards) == (rewards, None)
+        std = rewards.std()
+        assert chain_rewards_and_std(_group(7, [1.0, 0.0]), rewards, std) == (rewards, std)
 
 
 class TestFullyAsyncDataBufferWithNeverGiveUp:

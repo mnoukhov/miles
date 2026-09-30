@@ -257,14 +257,13 @@ def _normalize_rewards_by_rollout(
             shared_rewards.append(sibling_rewards[0])
 
         rollout_rewards = torch.tensor(shared_rewards, dtype=torch.float)
-        rollout_std = None
+        rollout_std = rollout_rewards.std() if len(rollout_rewards) > 1 else torch.tensor(0.0)
         if getattr(args, "async_unused_samples_handler", None) == "never_give_up":
             # A merged group trains against its whole chain of attempts, stale-pruned ones included.
             group_samples = [samples[segment_index] for segment_index in prompt_segments]
-            rollout_rewards, rollout_std = chain_rewards_and_std(group_samples, rollout_rewards)
+            rollout_rewards, rollout_std = chain_rewards_and_std(group_samples, rollout_rewards, rollout_std)
         normalized_rollout_rewards = rollout_rewards - rollout_rewards.mean()
         if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization and len(rollout_rewards) > 1:
-            rollout_std = rollout_rewards.std() if rollout_std is None else rollout_std
             if rollout_std > 0:
                 normalized_rollout_rewards = normalized_rollout_rewards / (rollout_std + 1e-6)
 
