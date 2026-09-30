@@ -74,11 +74,12 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self.state = GenerateState(input.args)
         # default to sample level backfill for fully async rollout
         self._scheduler = make_submission_scheduler(input.args, default="sample")
-        assert input.args.async_unused_samples_handler in ("retry", "drop", "never_give_up")
-        # told what became of every finished group; "drop" discards the unused ones instead of recycling
-        self._handle_unused = self._recycle if input.args.async_unused_samples_handler == "retry" else drop_unused
-        if input.args.async_unused_samples_handler == "never_give_up":
-            self._handle_unused = NeverGiveUp(input.args, data_source=self.data_source)
+        # told what became of every finished group; built lazily so only the chosen handler is created
+        self._handle_unused = {
+            "drop": lambda: drop_unused,
+            "retry": lambda: self._recycle,
+            "never_give_up": lambda: NeverGiveUp(input.args, data_source=self.data_source),
+        }[input.args.async_unused_samples_handler]()
         self._sample_filter = load_function(input.args.rollout_sample_filter_path)
         self._worker: asyncio.Task | None = None
         self._eval_prompt_dataset_cache: dict = {}
