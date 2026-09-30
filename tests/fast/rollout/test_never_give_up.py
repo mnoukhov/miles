@@ -13,10 +13,11 @@ from miles.rollout.filter_hub.base_types import FilterOutput
 from miles.rollout.filter_hub.common_filters import FilterReason
 from miles.rollout.fully_async_data_buffer import DataBufferConstructorInput, DataBufferInput, DefaultDataBuffer
 from miles.rollout.never_give_up import (
+    NGU_BASELINE_REWARD_SQ_SUM_KEY,
     NGU_BASELINE_REWARD_SUM_KEY,
     NGU_BASELINE_SAMPLE_COUNT_KEY,
     NeverGiveUp,
-    anchor_positive_advantages,
+    chain_rewards_and_std,
     make_retry_group,
     prune_stale_attempts,
 )
@@ -184,6 +185,7 @@ class TestStaleGroups:
 
         assert _offer(ngu, retry).keep
         assert retry[0].metadata[NGU_BASELINE_REWARD_SUM_KEY] == 2.0  # 1.0 from the first, 1.0 from the retry
+        assert retry[0].metadata[NGU_BASELINE_REWARD_SQ_SUM_KEY] == 2.0
         assert retry[0].metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] == 3 * GROUP_SIZE
 
 
@@ -227,17 +229,30 @@ class TestHelpers:
 
         assert [sample.index for sample in pruned] == [2, 3, 4, 5]
 
-    def test_anchor_keeps_positives_and_sums_to_zero(self):
-        rewards = torch.tensor([0.0, 0.0, 0.0, 1.0])
-        out = anchor_positive_advantages(rewards - 0.125, rewards)
+    def test_chain_shift_moves_only_the_negatives_to_the_chain_baseline(self):
+        group = _group(7, [1.0, 0.0, 0.0, 0.0])
+        group[0].metadata.update(
+            ngu_baseline_reward_sum=1.0, ngu_baseline_reward_sq_sum=1.0, ngu_baseline_sample_count=8
+        )
 
-        assert out[3] == pytest.approx(0.875)
-        assert float(out.sum()) == pytest.approx(0.0, abs=1e-6)
-        assert torch.allclose(out[:3], torch.full((3,), -0.875 / 3))
+        rewards, std = chain_rewards_and_std(group, torch.tensor([1.0, 0.0, 0.0, 0.0]))
 
-    def test_anchor_leaves_equal_rewards_alone(self):
-        advantages = torch.tensor([0.5, 0.5])
-        assert torch.equal(anchor_positive_advantages(advantages, torch.tensor([1.0, 1.0])), advantages)
+        assert rewards.tolist() == pytest.approx([1.0, -1 / 6, -1 / 6, -1 / 6])
+        assert float(rewards.mean()) == pytest.approx(0.125)
+        assert float(std) == pytest.approx(0.125**0.5)
+
+    def test_chain_shift_is_skipped_when_a_negative_would_overtake_the_max(self):
+        group = _group(7, [0.6, 0.2, 0.0, 0.0])  # stale [0.9] * 4: b = 0.55 would lift 0.2 to 0.667
+        group[0].metadata.update(
+            ngu_baseline_reward_sum=4.4, ngu_baseline_reward_sq_sum=3.64, ngu_baseline_sample_count=8
+        )
+        rewards = torch.tensor([0.6, 0.2, 0.0, 0.0])
+
+        assert torch.equal(chain_rewards_and_std(group, rewards)[0], rewards)
+
+    def test_a_group_without_chain_stats_is_left_alone(self):
+        rewards = torch.tensor([1.0, 0.0])
+        assert chain_rewards_and_std(_group(7, [1.0, 0.0]), rewards) == (rewards, None)
 
 
 class TestFullyAsyncDataBufferWithNeverGiveUp:

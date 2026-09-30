@@ -18,9 +18,9 @@ The :class:`NeverGiveUp` handler is told why a group is or is not trained on:
   ``--max-weight-staleness`` weight versions old), so it holds a multiple of
   ``n_samples_per_prompt`` samples, and the chain ends.
 
-A merged group's advantage baseline is the mean reward over *every* attempt in the chain, and the
-max-reward samples are anchored while the others are rescaled so the group sums to zero
-(:func:`anchor_positive_advantages`).
+A merged group trains against its whole chain, stale-pruned attempts included: before the GRPO
+step, :func:`chain_rewards_and_std` shifts the rewards below the group max so the group's mean is
+the chain's mean reward, and gives the chain's reward std.
 
 A port of allenai/open-instruct#1861.
 """
@@ -40,8 +40,9 @@ if TYPE_CHECKING:  # a runtime import would be circular through miles.rollout.ba
     from miles.rollout.data_source import RolloutDataSourceWithBuffer
 
 NGU_BASELINE_REWARD_SUM_KEY = "ngu_baseline_reward_sum"
+NGU_BASELINE_REWARD_SQ_SUM_KEY = "ngu_baseline_reward_sq_sum"
 NGU_BASELINE_SAMPLE_COUNT_KEY = "ngu_baseline_sample_count"
-_NGU_METADATA_KEYS = (NGU_BASELINE_REWARD_SUM_KEY, NGU_BASELINE_SAMPLE_COUNT_KEY)
+_NGU_METADATA_KEYS = (NGU_BASELINE_REWARD_SUM_KEY, NGU_BASELINE_REWARD_SQ_SUM_KEY, NGU_BASELINE_SAMPLE_COUNT_KEY)
 
 
 @dataclass
@@ -52,6 +53,7 @@ class PendingChain:
     best_reward: float | None = None  # None right after a stale reset
     samples: list[Sample] = field(default_factory=list)  # buffered attempts, n_samples_per_prompt each
     reward_sum: float = 0.0
+    reward_sq_sum: float = 0.0
     sample_count: int = 0
 
 
@@ -89,11 +91,15 @@ class NeverGiveUp(UnusedSamplesHandler):
             current_version=group_weight_version_stats(group).newest_version,
             max_staleness=self._args.max_weight_staleness,
         )
-        reward_sum = pending.reward_sum + sum(_rewards(self._args, group))
+        rewards = _rewards(self._args, group)
+        chain_stats = {
+            NGU_BASELINE_REWARD_SUM_KEY: pending.reward_sum + sum(rewards),
+            NGU_BASELINE_REWARD_SQ_SUM_KEY: pending.reward_sq_sum + _sq_sum(rewards),
+            NGU_BASELINE_SAMPLE_COUNT_KEY: pending.sample_count + len(group),
+        }
         for sample in merged:
             sample.group_index = group[0].group_index
-            sample.metadata[NGU_BASELINE_REWARD_SUM_KEY] = reward_sum
-            sample.metadata[NGU_BASELINE_SAMPLE_COUNT_KEY] = pending.sample_count + len(group)
+            sample.metadata.update(chain_stats)
         group[:] = merged
 
     def _retry_pending_chain(self, group: list[Sample]) -> None:
@@ -103,9 +109,10 @@ class NeverGiveUp(UnusedSamplesHandler):
     def _keep_going_after_stale(self, group: list[Sample]) -> None:
         """A stale accepted attempt failed to train, but its rewards still shape the baseline."""
         pending = self._chains.get(group[0].group_index) or PendingChain(retry_template=group[0])
-        metadata = group[0].metadata
+        metadata, rewards = group[0].metadata, _rewards(self._args, group)
         pending.samples.extend(group)
-        pending.reward_sum += metadata.get(NGU_BASELINE_REWARD_SUM_KEY, sum(_rewards(self._args, group)))
+        pending.reward_sum += metadata.get(NGU_BASELINE_REWARD_SUM_KEY, sum(rewards))
+        pending.reward_sq_sum += metadata.get(NGU_BASELINE_REWARD_SQ_SUM_KEY, _sq_sum(rewards))
         pending.sample_count += metadata.get(NGU_BASELINE_SAMPLE_COUNT_KEY, len(group))
         pending.best_reward = None
         self._chains[group[0].group_index] = pending
@@ -121,6 +128,7 @@ class NeverGiveUp(UnusedSamplesHandler):
 
         pending.samples.extend(group)
         pending.reward_sum += sum(rewards)
+        pending.reward_sq_sum += _sq_sum(rewards)
         pending.sample_count += len(group)
         pending.best_reward = best_reward
         self._chains[chain_id] = pending
@@ -133,6 +141,10 @@ class NeverGiveUp(UnusedSamplesHandler):
 
 def _rewards(args, group: list[Sample]) -> list[float]:
     return [sample.get_reward_value(args) for sample in group]
+
+
+def _sq_sum(rewards: list[float]) -> float:
+    return sum(reward * reward for reward in rewards)
 
 
 def _split_attempts(group: list[Sample], *, attempt_size: int) -> list[list[Sample]]:
@@ -170,28 +182,31 @@ def prune_stale_attempts(
     return [sample for attempt in [*kept, attempts[-1]] for sample in attempt]
 
 
-def ngu_baseline_mean(samples: list[Sample]) -> float | None:
-    """The chain-wide mean reward NGU recorded on a group, if any."""
-    metadata = samples[0].metadata
-    if NGU_BASELINE_SAMPLE_COUNT_KEY not in metadata:
-        return None
-    return metadata[NGU_BASELINE_REWARD_SUM_KEY] / metadata[NGU_BASELINE_SAMPLE_COUNT_KEY]
+def chain_rewards_and_std(
+    group_samples: list[Sample], rewards: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """The rewards and reward std a group's GRPO step should use.
 
-
-def anchor_positive_advantages(advantages: torch.Tensor, rewards: torch.Tensor) -> torch.Tensor:
-    """Keep the max-reward samples' advantages and rescale the others so the group sums to zero.
-
-    With a chain-wide baseline the group no longer sums to zero. The max-reward samples carry
-    the signal NGU retried for, so they are kept as is and the rest absorb the difference.
+    For a merged never_give_up group the rewards below the group max are shifted by one amount so
+    the group's mean becomes the chain baseline ``b`` (mean reward over every attempt in the chain,
+    stale-pruned ones included), and the std is the chain's std around ``b``. The shift is skipped
+    when it would lift a negative to the max. Any other group is returned as is, with no std (the
+    caller computes its own).
     """
-    is_positive = torch.isclose(rewards, rewards.max())
-    if bool(is_positive.all()):
-        return advantages
+    metadata = group_samples[0].metadata
+    if NGU_BASELINE_SAMPLE_COUNT_KEY not in metadata:
+        return rewards, None
 
-    negative_sum = advantages[~is_positive].sum()
-    if negative_sum == 0:
-        return advantages
+    count = metadata[NGU_BASELINE_SAMPLE_COUNT_KEY]
+    baseline = metadata[NGU_BASELINE_REWARD_SUM_KEY] / count
+    variance = (metadata[NGU_BASELINE_REWARD_SQ_SUM_KEY] - count * baseline**2) / max(count - 1, 1)
+    std = torch.tensor(max(variance, 0.0) ** 0.5)
 
-    out = advantages.clone()
-    out[~is_positive] = advantages[~is_positive] * (-advantages[is_positive].sum() / negative_sum)
-    return out
+    is_negative = rewards < rewards.max()
+    if not bool(is_negative.any()):
+        return rewards, std
+    shifted = rewards.clone()
+    shifted[is_negative] += (len(rewards) * baseline - rewards.sum()) / is_negative.sum()
+    if shifted[is_negative].max() >= rewards.max():  # a negative would overtake the max: skip the shift
+        return rewards, std
+    return shifted, std
