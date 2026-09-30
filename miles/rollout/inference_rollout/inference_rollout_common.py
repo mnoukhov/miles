@@ -17,6 +17,7 @@ from miles.rollout.base_types import (
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
 )
+from miles.rollout.filter_hub.base_types import drop_unused
 from miles.rollout.generate_hub.single_turn import generate
 from miles.rollout.generate_utils.generate_endpoint_utils import policy_uses_routing_key
 from miles.rollout.inference_rollout.compatibility import load_generate_function
@@ -229,7 +230,7 @@ class InferenceRolloutFn(BaseRolloutFn):
         from miles.rollout.inference_rollout.inference_rollout_train import generate_rollout_async
 
         output, aborted_samples = await generate_rollout_async(
-            self.state, input.rollout_id, self.data_source.get_samples, handle_unused=self.never_give_up
+            self.state, input.rollout_id, self.data_source.get_samples, handle_unused=self.never_give_up or drop_unused
         )
         self.data_source.add_samples(aborted_samples)
         if self.never_give_up is not None:

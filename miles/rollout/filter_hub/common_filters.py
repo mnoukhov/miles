@@ -20,7 +20,7 @@ class FilterReason(StrEnum):
     aborted = "group_has_aborted"
     missing_reward = "group_has_missing_reward"
     stale = "stale"
-    kept = "kept"  # the group trains after all: only the never_give_up handler is told
+    kept = "kept"  # the group trains after all
 
 
 @dataclass(frozen=True)

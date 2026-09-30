@@ -31,6 +31,7 @@ from miles.rollout.base_types import (
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
 )
+from miles.rollout.filter_hub.base_types import drop_unused
 from miles.rollout.filter_hub.common_filters import FilterReason
 from miles.rollout.fully_async_data_buffer import (
     DataBuffer,
@@ -74,10 +75,8 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         # default to sample level backfill for fully async rollout
         self._scheduler = make_submission_scheduler(input.args, default="sample")
         assert input.args.async_unused_samples_handler in ("retry", "drop", "never_give_up")
-        # applied to every group we do not train on; "drop" discards instead of recycling
-        self._handle_unused = (
-            self._recycle if input.args.async_unused_samples_handler == "retry" else (lambda prompt_group, **_: None)
-        )
+        # told what became of every finished group; "drop" discards the unused ones instead of recycling
+        self._handle_unused = self._recycle if input.args.async_unused_samples_handler == "retry" else drop_unused
         if input.args.async_unused_samples_handler == "never_give_up":
             self._handle_unused = NeverGiveUp(input.args, data_source=self.data_source)
         self._sample_filter = load_function(input.args.rollout_sample_filter_path)

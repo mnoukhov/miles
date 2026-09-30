@@ -24,7 +24,7 @@ from miles.rollout.filter_hub.common_filters import (
     group_staleness,
     group_weight_version_stats,
 )
-from miles.rollout.never_give_up import NeverGiveUp, prune_stale_attempts
+from miles.rollout.never_give_up import prune_stale_attempts
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
 
@@ -140,7 +140,6 @@ class DefaultDataBuffer(DataBuffer):
 
         self._unused_handler_fn = input.unused_handler_fn
         self._dynamic_filter = load_function(args.dynamic_sampling_filter_path)
-        self._never_give_up = isinstance(input.unused_handler_fn, NeverGiveUp)
         self._cond = asyncio.Condition()
         self._current_version: int | None = None
 
@@ -184,8 +183,7 @@ class DefaultDataBuffer(DataBuffer):
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
             self._unused_handler_fn(input.prompt_group, group=input.group, reason=output.reason)
             return False
-        if self._never_give_up:
-            self._unused_handler_fn(input.prompt_group, group=input.group, reason=FilterReason.kept)
+        self._unused_handler_fn(input.prompt_group, group=input.group, reason=FilterReason.kept)
         return True
 
     async def get(self, current_version: int | None = None, **_) -> DataBufferInput:
@@ -197,13 +195,12 @@ class DefaultDataBuffer(DataBuffer):
                     await self._cond.wait()
                 entry = self._buffer.pop(0)
                 self._cond.notify_all()  # wake producers blocked on a full buffer
-                if self._never_give_up:
-                    entry.group = prune_stale_attempts(
-                        entry.group,
-                        attempt_size=self._args.n_samples_per_prompt,
-                        current_version=current_version,
-                        max_staleness=self._args.max_weight_staleness,
-                    )
+                entry.group = prune_stale_attempts(  # only a merged never_give_up group has attempts to prune
+                    entry.group,
+                    attempt_size=self._args.n_samples_per_prompt,
+                    current_version=current_version,
+                    max_staleness=self._args.max_weight_staleness,
+                )
 
                 version_stats = group_weight_version_stats(entry.group)
                 staleness = version_stats.oldest_lag(current_version)

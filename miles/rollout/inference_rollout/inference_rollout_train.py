@@ -8,12 +8,11 @@ from packaging.version import parse
 from tqdm import tqdm
 
 from miles.rollout.base_types import RolloutFnTrainOutput
-from miles.rollout.filter_hub.base_types import MetricGatherer, UnusedSamplesHandler
+from miles.rollout.filter_hub.base_types import MetricGatherer, UnusedSamplesHandler, drop_unused
 from miles.rollout.filter_hub.common_filters import FilterReason, apply_preput_filters
 from miles.rollout.generate_utils.prefill_logprobs import recompute_samples_rollout_logprobs_via_prefill
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
-from miles.rollout.never_give_up import NeverGiveUp
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils import dumper_utils
 from miles.utils.function_registry import load_function
@@ -95,7 +94,7 @@ async def generate_rollout_async(
     state: GenerateState,
     rollout_id: int,
     data_source: Callable[[int], list[list[Sample]]],
-    handle_unused: UnusedSamplesHandler | None = None,
+    handle_unused: UnusedSamplesHandler = drop_unused,
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     args = state.args
     assert args.rollout_global_dataset
@@ -152,15 +151,13 @@ async def generate_rollout_async(
             filter_output = apply_preput_filters(args, dynamic_filter, group)
             if not filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
-                if handle_unused is not None:
-                    handle_unused(group, group=group, reason=filter_output.reason)
+                handle_unused(group, group=group, reason=filter_output.reason)
                 continue
 
             # add the samples to the data
             # NOTE: here we have not stored all the unused samples back to the data buffer.
             if len(data) < target_data_size:
-                if isinstance(handle_unused, NeverGiveUp):
-                    handle_unused(group, group=group, reason=FilterReason.kept)
+                handle_unused(group, group=group, reason=FilterReason.kept)
                 data.append(group)
                 pbar.update(len(group))
 
