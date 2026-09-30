@@ -65,6 +65,25 @@ def resolve_rollout_function_paths(args) -> tuple[str, str]:
     return rollout_path, eval_path
 
 
+def _validate_never_give_up_args(args) -> None:
+    if args.async_unused_samples_handler != "never_give_up":
+        return
+    assert (
+        0.0 <= args.ngu_requeue_probability <= 1.0
+    ), f"--ngu-requeue-probability must be in [0, 1], got {args.ngu_requeue_probability}"
+    assert (
+        args.dynamic_sampling_filter_path is not None
+    ), "never_give_up retries groups the dynamic sampling filter rejects; set --dynamic-sampling-filter-path"
+    assert args.fully_async, "never_give_up runs in --fully-async mode only"
+    assert (
+        args.custom_async_data_buffer_path is None
+        and getattr(args, "custom_async_data_buffer_path_per_model", None) is None
+    ), "never_give_up runs in the default fully-async data buffer; drop --custom-async-data-buffer-path"
+    assert not args.partial_rollout, "never_give_up does not support --partial-rollout"
+    # Merged groups make the sample count vary, and trimming it to --global-batch-size could split one.
+    assert args.use_dynamic_global_batch_size, "never_give_up requires --use-dynamic-global-batch-size"
+
+
 def _resolve_rollout_functions(args) -> None:
     if args.rollout_function_path == FULLY_ASYNC_ROLLOUT_PATH:
         # The selection --fully-async makes, so enable the mode: as a plugin path it would
@@ -810,6 +829,24 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--ngu-requeue-probability",
+                type=float,
+                default=1.0,
+                help=(
+                    "With --async-unused-samples-handler never_give_up (Never Give Up, NGU): probability in "
+                    "[0, 1] that an unsolved prompt group rejected by --dynamic-sampling-filter-path is requeued "
+                    "for another attempt instead of dropped. Earlier attempts are buffered until the filter keeps "
+                    "one; then the attempts at most --max-weight-staleness versions old train together as one "
+                    "group, with the mean reward over the whole chain of attempts as the baseline."
+                ),
+            )
+            parser.add_argument(
+                "--ngu-solved-reward",
+                type=float,
+                default=1.0,
+                help="Reward at which a prompt counts as solved; NGU never requeues a solved prompt.",
+            )
+            parser.add_argument(
                 "--rollout-submission-granularity",
                 type=str,
                 choices=["group", "sample"],
@@ -883,14 +920,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--async-unused-samples-handler",
                 type=str,
-                choices=["retry", "drop"],
+                choices=["retry", "drop", "never_give_up"],
                 default="drop",
                 help=(
                     "What to do with a finished group fully async mode does not train on "
                     "(aborted, or beyond --max-weight-staleness): drop "
                     "(default) discards the group; retry recycles its prompts into the data "
                     "source for regeneration. Groups rejected by "
-                    "--dynamic-sampling-filter-path are always dropped."
+                    "--dynamic-sampling-filter-path are dropped, except by never_give_up, which retries "
+                    "them (see --ngu-requeue-probability)."
                 ),
             )
             parser.add_argument(
@@ -3729,6 +3767,7 @@ def miles_validate_args(args):
         )
 
     _resolve_rollout_functions(args)
+    _validate_never_give_up_args(args)
 
     # Both snapshot postures drive the same RolloutManager._eval_checkpoint path.
     # (The fleet-vs-CheckpointEvalFn conflict is asserted where the posture is derived.)

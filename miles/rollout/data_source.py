@@ -122,6 +122,12 @@ class RolloutDataSource(DataSource):
             samples.append(group)
         return samples
 
+    def reserve_sample_indices(self, num_samples: int) -> list[int]:
+        """Take the next sample indices for samples built outside get_samples, e.g. retries."""
+        indices = list(range(self.sample_index, self.sample_index + num_samples))
+        self.sample_index += num_samples
+        return indices
+
     def add_samples(self, samples: list[list[Sample]]):
         raise RuntimeError(f"Cannot add samples to {self.__class__.__name__}. This is a read-only data source.")
 

@@ -31,6 +31,8 @@ from miles.rollout.base_types import (
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
 )
+from miles.rollout.filter_hub.base_types import drop_unused
+from miles.rollout.filter_hub.common_filters import FilterReason
 from miles.rollout.fully_async_data_buffer import (
     DataBuffer,
     DataBufferConstructorInput,
@@ -44,6 +46,7 @@ from miles.rollout.fully_async_data_buffer import (
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
+from miles.rollout.never_give_up import NeverGiveUp
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
@@ -71,11 +74,14 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self.state = GenerateState(input.args)
         # default to sample level backfill for fully async rollout
         self._scheduler = make_submission_scheduler(input.args, default="sample")
-        assert input.args.async_unused_samples_handler in ("retry", "drop")
-        # applied to every group we do not train on; "drop" discards instead of recycling
-        self._handle_unused = (
-            self._recycle if input.args.async_unused_samples_handler == "retry" else (lambda prompt_group: None)
-        )
+        # told what became of every finished group
+        handler = input.args.async_unused_samples_handler
+        if handler == "never_give_up":
+            self._handle_unused = NeverGiveUp(input.args, data_source=self.data_source)
+        elif handler == "retry":
+            self._handle_unused = self._recycle
+        else:
+            self._handle_unused = drop_unused
         self._sample_filter = load_function(input.args.rollout_sample_filter_path)
         self._worker: asyncio.Task | None = None
         self._eval_prompt_dataset_cache: dict = {}
@@ -205,7 +211,8 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             entry = await self._next_group(
                 current_version=input.weight_version, trainer_model_id=input.trainer_model_id
             )
-            assert len(entry.group) == args.n_samples_per_prompt
+            # A never_give_up group merges several attempts at its prompt.
+            assert len(entry.group) % args.n_samples_per_prompt == 0
 
             if do_print:
                 sample = first_sample(entry.group)
@@ -234,7 +241,10 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
 
         return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics(input.trainer_model_id))
 
-    def _recycle(self, prompt_group: list[Sample]) -> None:
+    def _recycle(self, prompt_group: list[Sample], *, group: Group, reason: str | None) -> None:
+        """Recycle aborted and stale groups; groups the filters reject are dropped."""
+        if reason not in (FilterReason.aborted, FilterReason.stale):
+            return
         for sample in prompt_group:
             sample.reset_for_retry()
         self.data_source.add_samples([prompt_group])
