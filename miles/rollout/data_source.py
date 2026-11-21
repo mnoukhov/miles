@@ -38,6 +38,10 @@ class DataSource(abc.ABC):
         Load the state of the data source
         """
 
+    def reserve_sample_indices(self, num_samples: int) -> list[int]:
+        """Take the next ``Sample.index`` values for samples built outside get_samples, e.g. never_give_up retries."""
+        raise NotImplementedError(f"{type(self).__name__} does not hand out sample indices")
+
     def get_buffer_length(self) -> int | None:
         """Pending-sample backlog, or None for sources without a buffer."""
         return None
@@ -136,6 +140,11 @@ class RolloutDataSource(DataSource):
             self.sample_group_index += 1
             samples.append(group)
         return samples
+
+    def reserve_sample_indices(self, num_samples: int) -> list[int]:
+        indices = list(range(self.sample_index, self.sample_index + num_samples))
+        self.sample_index += num_samples
+        return indices
 
     def save(self, directory: Path) -> None:
         if not self.args.rollout_global_dataset:
@@ -341,6 +350,11 @@ class MixedRolloutDataSource(DataSource):
         random.Random(self.args.rollout_seed * _MIX_SEED_STRIDE + self.num_requests).shuffle(prompts)
         self.num_requests += 1
         return [self._make_group(config, prompt) for config, prompt in prompts]
+
+    def reserve_sample_indices(self, num_samples: int) -> list[int]:
+        indices = list(range(self.sample_index, self.sample_index + num_samples))
+        self.sample_index += num_samples
+        return indices
 
     def save(self, directory: Path) -> None:
         state_dict = {

@@ -1,6 +1,7 @@
 from tests.ci.ci_register import register_cpu_ci
 from tests.fast.fixtures.args_fixtures import sglang_router_args
 from tests.fast.fixtures.megatron_config_fixtures import encode_megatron_config
+from tests.fast.fixtures.resampling_fixtures import RecordingPolicy
 from tests.fast.fixtures.sglang_config_fixtures import make_sglang_config
 
 register_cpu_ci(est_time=60, suite="stage-b-cpu", labels=["fully-async"])
@@ -28,6 +29,7 @@ from miles.backends.megatron_utils.megatron_config import resolve_megatron_confi
 from miles.rollout.base_types import BaseRolloutFn, RolloutFnConstructorInput, RolloutFnEvalInput, RolloutFnTrainInput
 from miles.rollout.filter_hub.base_types import FilterOutput
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState
+from miles.rollout.resampling import NoResampling, ResampleOnFailure
 from miles.utils.audit_utils.event_logger.logger import EventLogger, read_events, set_event_logger
 from miles.utils.audit_utils.event_logger.models import ExplicitlyDroppedSamplesEvent
 from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
@@ -343,7 +345,7 @@ class TestRetryBuffer:
         source = FakeDataSource()
         fn = make_fn(monkeypatch, make_args(rollout_batch_size=1), source)
         group = make_group(7)
-        fn._recycle(group, data_buffer.UnusedReason.ABORTED)
+        fn._requeue(group)
 
         task = fn._submit_one_group()
 
@@ -706,7 +708,9 @@ def make_buffer(max_groups=None, max_staleness=None):
         max_weight_staleness=max_staleness,
     )
     buffer = data_buffer.DefaultDataBuffer(
-        data_buffer.DataBufferConstructorInput(args=args, unused_handler_fn=lambda group, reason: unused.append(group))
+        data_buffer.DataBufferConstructorInput(
+            args=args, resampling_policy=RecordingPolicy(lambda group, reason: unused.append(group))
+        )
     )
     return buffer, unused
 
@@ -726,7 +730,9 @@ async def test_buffer_reports_raw_reward_across_kept_and_dropped():
     """raw_reward includes dropped groups even though only accepted groups reach training."""
     args = make_args(rollout_batch_size=1, dynamic_sampling_filter_path=f"{__name__}.reject_group_1")
     buffer = data_buffer.DefaultDataBuffer(
-        data_buffer.DataBufferConstructorInput(args=args, unused_handler_fn=lambda group, reason: None)
+        data_buffer.DataBufferConstructorInput(
+            args=args, resampling_policy=RecordingPolicy(lambda group, reason: None)
+        )
     )
 
     await put_group(buffer, make_group(1, reward=0))
@@ -746,7 +752,9 @@ async def test_dynamic_filter_records_the_prompt_as_explicitly_dropped(sample_fl
         dynamic_sampling_filter_path=f"{__name__}.reject_group_1",
     )
     buffer = data_buffer.DefaultDataBuffer(
-        data_buffer.DataBufferConstructorInput(args=args, unused_handler_fn=lambda group, reason: None)
+        data_buffer.DataBufferConstructorInput(
+            args=args, resampling_policy=RecordingPolicy(lambda group, reason: None)
+        )
     )
 
     await put_group(buffer, make_group(1, reward=0))
@@ -761,7 +769,9 @@ async def test_missing_reward_records_the_prompt_as_explicitly_dropped(sample_fl
     """A group dropped for a missing reward resolves its issued samples, like every other drop."""
     args = make_args(enable_sample_ownership_checker=True, rollout_batch_size=1)
     buffer = data_buffer.DefaultDataBuffer(
-        data_buffer.DataBufferConstructorInput(args=args, unused_handler_fn=lambda group, reason: None)
+        data_buffer.DataBufferConstructorInput(
+            args=args, resampling_policy=RecordingPolicy(lambda group, reason: None)
+        )
     )
 
     await put_group(buffer, make_group(1, reward=None))
@@ -774,11 +784,11 @@ async def test_missing_reward_records_the_prompt_as_explicitly_dropped(sample_fl
 
 async def test_stale_group_reports_the_reason_to_the_unused_policy() -> None:
     """The configured policy can distinguish stale output from aborted generation."""
-    calls: list[tuple[list[Sample], data_buffer.UnusedReason]] = []
+    calls: list[tuple[list[Sample], data_buffer.GroupOutcome]] = []
     args = make_args(rollout_batch_size=1, max_weight_staleness=0)
     buffer = data_buffer.DefaultDataBuffer(
         data_buffer.DataBufferConstructorInput(
-            args=args, unused_handler_fn=lambda group, reason: calls.append((group, reason))
+            args=args, resampling_policy=RecordingPolicy(lambda group, reason: calls.append((group, reason)))
         )
     )
     stale = make_group(1, weight_versions=["1"])
@@ -787,7 +797,7 @@ async def test_stale_group_reports_the_reason_to_the_unused_policy() -> None:
     await put_group(buffer, fresh)
 
     assert (await get_one(buffer, current_version=2)).group == fresh
-    assert calls == [(stale, data_buffer.UnusedReason.STALE)]
+    assert calls == [(stale, data_buffer.GroupOutcome.STALE)]
 
 
 async def test_buffer_blocks_producer_when_full():
@@ -903,7 +913,9 @@ def make_multi_buffer(*model_ids: str, max_staleness=None, paths_per_model=None)
         custom_async_data_buffer_path_per_model=paths_per_model,
     )
     buffer = data_buffer.DefaultMultiDataBuffer(
-        data_buffer.DataBufferConstructorInput(args=args, unused_handler_fn=lambda group, reason: unused.append(group))
+        data_buffer.DataBufferConstructorInput(
+            args=args, resampling_policy=RecordingPolicy(lambda group, reason: unused.append(group))
+        )
     )
     return buffer, unused
 
@@ -1153,7 +1165,9 @@ class TestPerPolicyBufferClass:
             "solver", "verifier", paths_per_model=[f"solver={__name__}.RecordingBuffer"]
         )
 
-        RecordingBuffer.constructed_with.unused_handler_fn(["a-group"], "a-reason")
+        RecordingBuffer.constructed_with.resampling_policy(
+            data_buffer.DataBufferInput(prompt_group=["a-group"], group=[]), data_buffer.GroupOutcome.ABORTED
+        )
 
         assert unused == [["a-group"]]
         assert RecordingBuffer.constructed_with.args is buffer._inners["verifier"]._args
@@ -1218,7 +1232,8 @@ async def test_custom_data_buffer_path_replaces_default(monkeypatch):
     output = await fn(train_input(rollout_id=0))
 
     assert type(fn._output) is RecordingBuffer
-    assert RecordingBuffer.constructed_with.unused_handler_fn == fn._recycle
+    assert RecordingBuffer.constructed_with.resampling_policy is fn._resampling_policy
+    assert isinstance(fn._resampling_policy, ResampleOnFailure)
     assert len(output.samples) == 2
 
 
@@ -1292,7 +1307,9 @@ class TestBatchedGet:
 
         with pytest.raises(AssertionError, match="below the rollout batch"):
             data_buffer.DefaultDataBuffer(
-                data_buffer.DataBufferConstructorInput(args=args, unused_handler_fn=lambda group, reason: None)
+                data_buffer.DataBufferConstructorInput(
+                    args=args, resampling_policy=RecordingPolicy(lambda group, reason: None)
+                )
             )
 
     async def test_a_silent_producer_warns_and_keeps_waiting(self, monkeypatch, caplog):
@@ -1346,7 +1363,9 @@ async def start_drain_on_a_wedged_buffer(monkeypatch, worker):
     args = make_args(rollout_batch_size=1)
     fn = make_fn(monkeypatch, args, FakeDataSource())
     fn._output = WedgedBuffer(
-        data_buffer.DataBufferConstructorInput(args=args, unused_handler_fn=lambda group, reason: None)
+        data_buffer.DataBufferConstructorInput(
+            args=args, resampling_policy=RecordingPolicy(lambda group, reason: None)
+        )
     )
     watch_worker(fn, asyncio.create_task(worker))
     drain = asyncio.create_task(fn._drain(train_input(rollout_id=0)))
@@ -1385,7 +1404,9 @@ class TestDeadWorkerEndsTheWait:
         args = make_args(rollout_batch_size=1)
         fn = make_fn(monkeypatch, args, FakeDataSource())
         fn._output = WedgedBuffer(
-            data_buffer.DataBufferConstructorInput(args=args, unused_handler_fn=lambda group, reason: None)
+            data_buffer.DataBufferConstructorInput(
+                args=args, resampling_policy=RecordingPolicy(lambda group, reason: None)
+            )
         )
         watch_worker(fn, asyncio.create_task(_never_returns()))
         drains = [asyncio.create_task(fn._drain(train_input(rollout_id=0))) for _ in range(2)]
@@ -1787,8 +1808,8 @@ class TestInFlightBudget:
         source = FakeDataSource()
         fn = make_fn(monkeypatch, make_args(rollout_batch_size=1), source)
         first, second = make_group(1), make_group(2)
-        fn._recycle(first, data_buffer.UnusedReason.ABORTED)
-        fn._recycle(second, data_buffer.UnusedReason.ABORTED)
+        fn._requeue(first)
+        fn._requeue(second)
 
         tasks = [fn._submit_one_group() for _ in range(3)]
         submitted = [x.prompt_group for x in fn._running_tasks]
@@ -1914,16 +1935,20 @@ class TestStalenessAdmission:
             make_fn(monkeypatch, args, FakeDataSource())
 
 
-# ============================== unused handler ==============================
+# ============================== resampling policy =============================
 
 
-class TestUnusedHandler:
+def _entry(prompt_group: list[Sample]) -> data_buffer.DataBufferInput:
+    return data_buffer.DataBufferInput(prompt_group=prompt_group, group=prompt_group)
+
+
+class TestResamplingPolicy:
     def test_a_recycled_prompt_group_is_reset_before_it_is_queued_again(self, monkeypatch) -> None:
         """A prompt still carrying the last attempt's response and versions would be regenerated as stale output."""
         fn = make_fn(monkeypatch, make_args(async_unused_samples_handler="retry"), FakeDataSource())
         group = make_group(1, weight_versions=["3"])
 
-        fn._recycle(group, data_buffer.UnusedReason.ABORTED)
+        fn._resampling_policy(_entry(group), data_buffer.GroupOutcome.ABORTED)
 
         [queued] = fn._retry_buffer
         assert queued is group
@@ -1936,11 +1961,11 @@ class TestUnusedHandler:
         args = make_args(enable_sample_ownership_checker=True, async_unused_samples_handler="retry")
         fn = make_fn(monkeypatch, args, FakeDataSource())
 
-        fn._handle_unused(make_group(1), data_buffer.UnusedReason.ABORTED)
+        fn._resampling_policy(_entry(make_group(1)), data_buffer.GroupOutcome.ABORTED)
 
         assert read_events(sample_flow_event_dir) == []
 
-    @pytest.mark.parametrize("reason", [data_buffer.UnusedReason.ABORTED, data_buffer.UnusedReason.STALE])
+    @pytest.mark.parametrize("reason", [data_buffer.GroupOutcome.ABORTED, data_buffer.GroupOutcome.STALE])
     def test_a_dropped_group_records_the_unused_reason_it_was_dropped_for(
         self, monkeypatch, sample_flow_event_dir, reason
     ) -> None:
@@ -1948,7 +1973,7 @@ class TestUnusedHandler:
         args = make_args(enable_sample_ownership_checker=True, async_unused_samples_handler="drop")
         fn = make_fn(monkeypatch, args, FakeDataSource())
 
-        fn._handle_unused(make_group(1), reason)
+        fn._resampling_policy(_entry(make_group(1)), reason)
 
         [event] = read_events(sample_flow_event_dir)
         assert isinstance(event, ExplicitlyDroppedSamplesEvent)
@@ -1960,8 +1985,27 @@ class TestUnusedHandler:
         retrying = make_fn(monkeypatch, make_args(async_unused_samples_handler="retry"), FakeDataSource())
         dropping = make_fn(monkeypatch, make_args(async_unused_samples_handler="drop"), FakeDataSource())
 
-        assert retrying._handle_unused == retrying._recycle
-        assert dropping._handle_unused == dropping._drop_unused
+        assert isinstance(retrying._resampling_policy, ResampleOnFailure)
+        assert isinstance(dropping._resampling_policy, NoResampling)
+
+    @pytest.mark.parametrize("handler", ["drop", "retry"])
+    @pytest.mark.parametrize(
+        "outcome",
+        [data_buffer.GroupOutcome.KEPT, data_buffer.GroupOutcome.FILTERED, data_buffer.GroupOutcome.MISSING_REWARD],
+    )
+    def test_drop_and_retry_leave_kept_and_filtered_groups_alone(
+        self, monkeypatch, sample_flow_event_dir, handler, outcome
+    ) -> None:
+        """Only failed rounds are theirs to redo or record; the buffer already records filter rejections."""
+        args = make_args(enable_sample_ownership_checker=True, async_unused_samples_handler=handler)
+        fn = make_fn(monkeypatch, args, FakeDataSource())
+        group = make_group(1)
+
+        fn._resampling_policy(_entry(group), outcome)
+
+        assert not fn._retry_buffer and not fn._admission_changed.is_set()
+        assert read_events(sample_flow_event_dir) == []
+        assert [sample.response for sample in group] == ["ok", "ok"]
 
     def test_an_unknown_unused_samples_handler_is_refused_at_construction(self, monkeypatch) -> None:
         """A typo would silently pick one of the two policies, and which one is not something to guess."""
@@ -2199,7 +2243,8 @@ class TestLifecycle:
 
         await fn(train_input(rollout_id=0))
 
-        assert RecordingBuffer.constructed_with.unused_handler_fn == fn._drop_unused
+        assert RecordingBuffer.constructed_with.resampling_policy is fn._resampling_policy
+        assert isinstance(fn._resampling_policy, NoResampling)
         assert RecordingBuffer.constructed_with.args is args
 
     async def test_a_custom_buffer_path_that_names_nothing_falls_back_to_the_built_in_buffer(

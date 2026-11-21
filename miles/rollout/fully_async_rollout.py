@@ -43,13 +43,13 @@ from miles.rollout.fully_async_data_buffer import (
     DefaultDataBuffer,
     DefaultMultiDataBuffer,
     Group,
-    UnusedReason,
     add_data_buffer_arguments,
     first_sample,
 )
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
+from miles.rollout.resampling import make_resampling_policy
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils.audit_utils.sample_ownership.recorder import SampleOwnershipRecorder
 from miles.utils.function_registry import load_function
@@ -79,11 +79,6 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self.state = GenerateState(input.args)
         # default to sample level backfill for fully async rollout
         self._scheduler = make_submission_scheduler(input.args, default="sample")
-        assert input.args.async_unused_samples_handler in ("retry", "drop")
-        # applied to every group we do not train on; "drop" discards instead of recycling
-        self._handle_unused = (
-            self._recycle if input.args.async_unused_samples_handler == "retry" else self._drop_unused
-        )
         self._sample_filter = load_function(input.args.rollout_sample_filter_path)
         self._worker: asyncio.Task | None = None
         self._worker_error_cancel_targets: set[asyncio.Task] = set()
@@ -92,13 +87,19 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._producer_resumed = asyncio.Event()
         self._producer_resumed.set()
         self._admission_changed = asyncio.Event()
+        self._resampling_policy = make_resampling_policy(
+            self.args,
+            data_source=self.data_source,
+            requeue=self._requeue,
+            admission_changed=self._admission_changed.set,
+        )
         default_buffer_cls = DefaultMultiDataBuffer if self.args.raw_megatron.is_multi_policy else DefaultDataBuffer
         buffer_cls = load_function(self.args.custom_async_data_buffer_path) or default_buffer_cls
         assert (
             not self.args.async_submit_within_staleness or buffer_cls.admits is not DataBuffer.admits
         ), f"--async-submit-within-staleness requires {buffer_cls.__name__} to implement admits()"
         self._output: DataBuffer = buffer_cls(
-            DataBufferConstructorInput(args=self.args, unused_handler_fn=self._handle_unused)
+            DataBufferConstructorInput(args=self.args, resampling_policy=self._resampling_policy)
         )
         self._retry_buffer: deque[list[Sample]] = deque()
         self._running_tasks: list[_RunningTask] = []
@@ -240,7 +241,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         do_print = True
 
         for entry in entries:
-            assert len(entry.group) == args.n_samples_per_prompt
+            self._resampling_policy.check_trained_group(entry.group, n_samples_per_prompt=args.n_samples_per_prompt)
 
             if do_print:
                 sample = first_sample(entry.group)
@@ -273,16 +274,12 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             args=args, before=before_filter, after=data, reason="rollout_sample_filter"
         )
 
-        return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics(input.trainer_model_id))
+        metrics = self._output.get_metrics(input.trainer_model_id) | self._resampling_policy.rollout_metrics(data)
+        return RolloutFnTrainOutput(samples=data, metrics=metrics)
 
-    def _recycle(self, prompt_group: list[Sample], reason: UnusedReason) -> None:
-        for sample in prompt_group:
-            sample.reset_for_retry()
+    def _requeue(self, prompt_group: list[Sample]) -> None:
+        """Submit ``prompt_group`` again ahead of new prompts."""
         self._retry_buffer.append(prompt_group)
-        self._admission_changed.set()
-
-    def _drop_unused(self, prompt_group: list[Sample], reason: UnusedReason) -> None:
-        SampleOwnershipRecorder.log_dropped_samples(args=self.args, samples=prompt_group, reason=reason.value)
         self._admission_changed.set()
 
     def save(self, directory: Path) -> None:
@@ -290,6 +287,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             retry_buffer=list(self._retry_buffer),
             running=[_copy_and_reset_for_retry(x.prompt_group) for x in self._running_tasks],
             output=self._output.state_dict(),
+            resampling_policy=self._resampling_policy.state_dict(),
         )
         save_simple_checkpoint(directory=directory, data=state)
 
@@ -298,6 +296,10 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         state: _FullyAsyncRolloutState = load_simple_checkpoint(directory=directory)
         assert not self._retry_buffer, "restore the fully async rollout state before any group was recycled"
         self._retry_buffer = deque([*state.retry_buffer, *state.running])
+        # Before the buffer, which may tell the policy about groups it cannot restore.
+        # A checkpoint from before resampling policies unpickles to the field's class default, None.
+        if state.resampling_policy is not None:
+            self._resampling_policy.load_state_dict(state.resampling_policy)
         self._output.load_state_dict(state.output)
 
     def drop_saved_in_flight(self, directory: Path) -> None:
@@ -322,6 +324,7 @@ class _FullyAsyncRolloutState:
     retry_buffer: list[list[Sample]]
     running: list[list[Sample]]
     output: Any
+    resampling_policy: Any = None
 
 
 def _copy_and_reset_for_retry(prompt_group: list[Sample]) -> list[Sample]:

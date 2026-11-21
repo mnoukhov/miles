@@ -1958,6 +1958,8 @@ def miles_validate_args(args):
             "one optimizer step per rollout"
         )
 
+    _validate_never_give_up_args(args)
+
     # Multi-LoRA adapters carry their own n_samples_per_prompt; the per-group
     # normalization path already skips std for singleton groups.
     if args.n_samples_per_prompt == 1 and not args.multi_lora:
@@ -2095,6 +2097,29 @@ def miles_validate_args(args):
         raise ValueError("--mini-ft-controller-enable requires --api-server-port to be set (non-zero)")
 
     _validate_deploy_component(args)
+
+
+def _validate_never_give_up_args(args) -> None:
+    if args.async_unused_samples_handler != "never_give_up":
+        return
+    max_budget = args.ngu_max_budget
+    assert max_budget is None or max_budget >= 1, f"--ngu-max-budget must be at least 1, got {max_budget}"
+    assert args.fully_async, "never_give_up runs in --fully-async mode only"
+    assert (
+        args.dynamic_sampling_filter_path is not None
+    ), "never_give_up retries groups the dynamic sampling filter rejects; set --dynamic-sampling-filter-path"
+    assert (
+        args.custom_async_data_buffer_path is None
+    ), "never_give_up hooks into the default fully async data buffer; drop --custom-async-data-buffer-path"
+    assert not args.partial_rollout, "never_give_up does not support --partial-rollout"
+    # A merged group holds several attempts at its prompt, so the samples per rollout vary.
+    assert args.use_dynamic_global_batch_size, (
+        "never_give_up merges retried attempts into the group that trains, so a rollout's sample count varies; "
+        "set --use-dynamic-global-batch-size"
+    )
+    # Earlier attempts are recorded as dropped when the filter rejects them, then trained on after all.
+    assert not args.use_output_store, "never_give_up does not support --use-output-store"
+    assert not args.enable_sample_ownership_checker, "never_give_up does not support --enable-sample-ownership-checker"
 
 
 def validate_skip_actor_forward_only(args) -> None:

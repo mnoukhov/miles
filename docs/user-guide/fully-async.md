@@ -214,7 +214,7 @@ Staleness control decides which of those groups training is allowed to see:
 | Flag | Effect |
 |---|---|
 | `--max-weight-staleness` | Maximum gap between a group's oldest weight version and the current engine version. Unset by default, which disables the filter |
-| `--async-unused-samples-handler` | What happens to a group training does not use, either aborted or too stale. The default `drop` discards it; `retry` recycles its prompts into the data source for regeneration. Dynamic-filter rejects are always dropped |
+| `--async-unused-samples-handler` | What happens to a group training does not use, either aborted or too stale. The default `drop` discards it; `retry` recycles its prompts into the data source for regeneration. Dynamic-filter rejects are dropped, except by `never_give_up` (Never Give Up), which keeps retrying an unsolved prompt and merges its earlier attempts into the group that finally trains; it needs `--dynamic-sampling-filter-path` and `--use-dynamic-global-batch-size`, and is tuned by the `--ngu-*` flags |
 | `--async-submit-within-staleness` | Also applies `--max-weight-staleness N` when the worker submits a group, instead of only when the trainer takes it. Off by default |
 
 The filter rejects a group only after all of it was generated. With

@@ -13,9 +13,8 @@ import random
 import time
 from abc import ABC, abstractmethod
 from argparse import ArgumentParser, Namespace
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any
 
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, iter_samples
@@ -26,6 +25,7 @@ from miles.rollout.filter_hub.common_filters import (
     group_staleness,
     group_weight_version_stats,
 )
+from miles.rollout.resampling import GroupOutcome, ResamplingPolicy
 from miles.utils.audit_utils.sample_ownership.recorder import SampleOwnershipRecorder
 from miles.utils.function_registry import load_function
 from miles.utils.output_store.dropped import record_dropped_samples, regenerated_on_restore
@@ -40,13 +40,6 @@ Group = list[Sample | list[Sample]]
 DATA_BUFFER_PATH_PER_MODEL_FLAG = "--custom-async-data-buffer-path-per-model"
 
 NO_PROGRESS_WARN_SECS = 30.0
-
-
-class UnusedReason(str, Enum):
-    ABORTED = "aborted"
-    STALE = "stale"
-    # Restored from a checkpoint with output store refs, whose objects did not survive the restart.
-    RESTORED = "restored"
 
 
 def add_data_buffer_arguments(parser: ArgumentParser) -> None:
@@ -73,21 +66,19 @@ def first_sample(group: Group) -> Sample:
     return group[0][0] if isinstance(group[0], list) else group[0]
 
 
-@dataclass(frozen=True)
 # ================================== contract ==================================
-
-
-class DataBufferConstructorInput:
-    args: Namespace
-    unused_handler_fn: Callable[
-        [list[Sample], UnusedReason], None
-    ]  # --async-unused-samples-handler, applied to unused groups
 
 
 @dataclass
 class DataBufferInput:
     prompt_group: list[Sample]  # resubmittable, for recycling
     group: Group  # finished samples
+
+
+@dataclass(frozen=True)
+class DataBufferConstructorInput:
+    args: Namespace
+    resampling_policy: ResamplingPolicy  # --async-unused-samples-handler, told every group's outcome
 
 
 MULTI_POLICY_CHECKPOINT_UNSUPPORTED = "multi-policy rollout state is not checkpointed"
@@ -159,10 +150,11 @@ class DefaultDataBuffer(DataBuffer):
         training consumes.
     (2) selection: ``--async-data-buffer-selection`` hands a get the earliest
         finished groups (fifo) or a random subset of the buffered ones.
-    (3) unused handling: ``--async-unused-samples-handler`` decides what happens
-        to aborted and stale groups: drop discards them, retry recycles their
-        prompts for regeneration. Missing-reward and custom-filter rejections
-        are discarded directly.
+    (3) resampling: the ``ResamplingPolicy`` picked by ``--async-unused-samples-handler``
+        is told every group's outcome (see ``resampling.py``): drop discards aborted
+        and stale groups, retry recycles their prompts for regeneration, and
+        never_give_up also retries filter rejections and merges them into the kept
+        group. Missing-reward and filter rejections are recorded as dropped here.
     """
 
     def __init__(self, input: DataBufferConstructorInput):
@@ -177,7 +169,7 @@ class DefaultDataBuffer(DataBuffer):
             f"one get asks for, so --async-data-buffer-capacity-factor must be at least 1.0"
         )
 
-        self._unused_handler_fn = input.unused_handler_fn
+        self._resampling_policy = input.resampling_policy
         self._dynamic_filter = load_function(args.dynamic_sampling_filter_path)
         self._cond = asyncio.Condition()
         self._rng = random.Random(args.rollout_seed)
@@ -211,7 +203,7 @@ class DefaultDataBuffer(DataBuffer):
             self._metric_aborted_groups += 1
             # Before the handler: a retry resets the prompt group, plans included.
             record_dropped_samples([input.prompt_group, input.group])
-            self._unused_handler_fn(input.prompt_group, UnusedReason.ABORTED)
+            self._resampling_policy(input, GroupOutcome.ABORTED)
             return False
 
         output = apply_missing_reward_filter(self._args, input.group)
@@ -221,6 +213,7 @@ class DefaultDataBuffer(DataBuffer):
             SampleOwnershipRecorder.log_dropped_samples(
                 args=self._args, samples=input.prompt_group, reason="missing_reward"
             )
+            self._resampling_policy(input, GroupOutcome.MISSING_REWARD)
             return False
 
         self._metric_gatherer.on_group_before_dynamic_filter(self._args, input.group)
@@ -231,7 +224,9 @@ class DefaultDataBuffer(DataBuffer):
             SampleOwnershipRecorder.log_dropped_samples(
                 args=self._args, samples=input.prompt_group, reason="dynamic_filter"
             )
+            self._resampling_policy(input, GroupOutcome.FILTERED)
             return False
+        self._resampling_policy(input, GroupOutcome.KEPT)
         return True
 
     async def get(self, *, num_groups: int, current_version: int | None = None, **_) -> list[DataBufferInput]:
@@ -277,16 +272,25 @@ class DefaultDataBuffer(DataBuffer):
 
     def _drop_stale(self, current_version: int | None) -> None:
         limit = self._args.max_weight_staleness
+
+        def staleness(entry: DataBufferInput) -> int | None:
+            return group_staleness(entry.group, current_version)
+
+        def is_stale(entry: DataBufferInput) -> bool:
+            return limit is not None and (value := staleness(entry)) is not None and value > limit
+
         kept: list[DataBufferInput] = []
         for entry in self._buffer:
-            staleness = group_staleness(entry.group, current_version)
-            if limit is None or staleness is None or staleness <= limit:
+            if is_stale(entry):
+                # The policy may prune the stale part of the group, e.g. never_give_up's aged-out rounds.
+                self._resampling_policy.prune_stale(entry, current_version=current_version)
+            if not is_stale(entry):
                 kept.append(entry)
             else:
-                logger.info(f"Filtered stale group ({staleness=} > max={limit})")
+                logger.info(f"Filtered stale group (staleness={staleness(entry)} > max={limit})")
                 self._metric_stale_groups += 1
                 record_dropped_samples([entry.prompt_group, entry.group])
-                self._unused_handler_fn(entry.prompt_group, UnusedReason.STALE)
+                self._resampling_policy(entry, GroupOutcome.STALE)
 
         if len(kept) != len(self._buffer):
             self._buffer = kept
@@ -320,7 +324,7 @@ class DefaultDataBuffer(DataBuffer):
         for entry in state:
             if regenerated_on_restore(entry.group, use_output_store=self._args.use_output_store):
                 record_dropped_samples([entry.prompt_group, entry.group])
-                self._unused_handler_fn(entry.prompt_group, UnusedReason.RESTORED)
+                self._resampling_policy(entry, GroupOutcome.RESTORED)
             else:
                 self._buffer.append(entry)
 
@@ -345,6 +349,7 @@ class DefaultDataBuffer(DataBuffer):
             f"{prefix}aborted_groups_filtered": self._metric_aborted_groups,
             f"{prefix}stale_groups_filtered": self._metric_stale_groups,
             **self._metric_gatherer.collect(),
+            **self._resampling_policy.collect_metrics(),
         }
         if consumed := self._metric_consumed_staleness:
             metrics[f"{prefix}avg_staleness"] = sum(consumed) / len(consumed)
