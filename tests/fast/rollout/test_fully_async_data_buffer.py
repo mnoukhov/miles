@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from tests.fast.fixtures.megatron_config_fixtures import encode_megatron_config
+from tests.fast.fixtures.resampling_fixtures import RecordingPolicy
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
 from miles.rollout import fully_async_data_buffer
@@ -44,7 +45,7 @@ def _multi_buffer(monkeypatch: pytest.MonkeyPatch, *, model_ids: list[str]) -> D
         )
     )
     return DefaultMultiDataBuffer(
-        DataBufferConstructorInput(args=args, unused_handler_fn=lambda samples, reason: None)
+        DataBufferConstructorInput(args=args, resampling_policy=RecordingPolicy(lambda samples, reason: None))
     )
 
 
@@ -124,14 +125,16 @@ def _make_sample(*, index: int, reward: float, trainer_model_id: str) -> Sample:
     return sample
 
 
-def _ignore_group(group: list[Sample], reason: fully_async_data_buffer.UnusedReason) -> None:
+def _ignore_group(group: list[Sample], reason: fully_async_data_buffer.GroupOutcome) -> None:
     pass
 
 
 class TestPerPolicyMetrics:
     async def test_collecting_one_policy_metrics_does_not_reset_another_policy_window(self) -> None:
         """Collecting one policy preserves another policy's resettable raw-reward window."""
-        buffer = DefaultMultiDataBuffer(DataBufferConstructorInput(args=_make_args(), unused_handler_fn=_ignore_group))
+        buffer = DefaultMultiDataBuffer(
+            DataBufferConstructorInput(args=_make_args(), resampling_policy=RecordingPolicy(_ignore_group))
+        )
         group = [
             _make_sample(index=1, reward=1.0, trainer_model_id="solver"),
             _make_sample(index=2, reward=3.0, trainer_model_id="verifier"),
@@ -150,7 +153,7 @@ import asyncio
 from dataclasses import dataclass
 
 from miles.rollout.filter_hub.base_types import DynamicFilterOutput
-from miles.rollout.fully_async_data_buffer import DefaultDataBuffer, Group, UnusedReason
+from miles.rollout.fully_async_data_buffer import DefaultDataBuffer, Group, GroupOutcome
 from miles.utils.types import WeightVersionSpan, WeightVersionsPerCall
 
 GROUP_SIZE = 2
@@ -200,15 +203,15 @@ def _make_finished_group(
 @dataclass
 class _BufferUnderTest:
     buffer: DefaultDataBuffer
-    unused: list[tuple[list[Sample], UnusedReason]]
+    unused: list[tuple[list[Sample], GroupOutcome]]
 
 
 def _make_buffer(**overrides) -> _BufferUnderTest:
-    unused: list[tuple[list[Sample], UnusedReason]] = []
+    unused: list[tuple[list[Sample], GroupOutcome]] = []
     buffer = DefaultDataBuffer(
         DataBufferConstructorInput(
             args=_make_single_policy_args(**overrides),
-            unused_handler_fn=lambda prompt_group, reason: unused.append((prompt_group, reason)),
+            resampling_policy=RecordingPolicy(lambda prompt_group, reason: unused.append((prompt_group, reason))),
         )
     )
     return _BufferUnderTest(buffer=buffer, unused=unused)
@@ -255,7 +258,7 @@ class TestStalenessFiltering:
         await _put(under_test.buffer, fresh)
 
         assert (await _get_one(under_test.buffer, current_version=10)).group is fresh
-        assert under_test.unused == [(stale, UnusedReason.STALE)]
+        assert under_test.unused == [(stale, GroupOutcome.STALE)]
         assert under_test.buffer.get_metrics()["rollout/fully_async/stale_groups_filtered"] == 1
 
     async def test_a_group_dropped_for_staleness_is_left_out_of_the_consumed_staleness_metrics(self) -> None:
@@ -300,7 +303,7 @@ class TestStalenessFiltering:
             await _put(under_test.buffer, group)
 
         assert (await _get_one(under_test.buffer, current_version=10)).group is fresh
-        assert under_test.unused == [(stale, UnusedReason.STALE)]
+        assert under_test.unused == [(stale, GroupOutcome.STALE)]
 
         assert (await _get_one(under_test.buffer, current_version=10)).group is later
 
@@ -318,7 +321,7 @@ class TestStalenessFiltering:
         assert (await _get_one(under_test.buffer, current_version=10)).group is fresh
         await blocked
 
-        assert under_test.unused == [(stale, UnusedReason.STALE)]
+        assert under_test.unused == [(stale, GroupOutcome.STALE)]
         metrics = under_test.buffer.get_metrics()
         assert metrics["rollout/fully_async/stale_groups_filtered"] == 1
         assert metrics["rollout/fully_async/queue_size"] == 1
@@ -397,7 +400,7 @@ class TestRandomSelection:
 
         taken = [fresh_indices[i] for i in sorted(random.Random(7).sample(range(4), 2))]
         assert [entry.group[0].group_index for entry in entries] == taken
-        assert under_test.unused == [(group, UnusedReason.STALE) for group in stale]
+        assert under_test.unused == [(group, GroupOutcome.STALE) for group in stale]
 
 
 # =============================== capacity =================================
@@ -560,7 +563,7 @@ class TestPutTimeFilters:
 
         await _put(under_test.buffer, group)
 
-        assert under_test.unused == [(group, UnusedReason.ABORTED)]
+        assert under_test.unused == [(group, GroupOutcome.ABORTED)]
         assert under_test.buffer.get_metrics()["rollout/fully_async/aborted_groups_filtered"] == 1
 
     async def test_a_group_with_one_aborted_sample_among_finished_ones_is_refused_whole(self) -> None:
@@ -571,7 +574,7 @@ class TestPutTimeFilters:
 
         await _put(under_test.buffer, group)
 
-        assert under_test.unused == [(group, UnusedReason.ABORTED)]
+        assert under_test.unused == [(group, GroupOutcome.ABORTED)]
         assert under_test.buffer.get_metrics()["rollout/fully_async/queue_size"] == 0
 
     async def test_a_group_rejected_by_the_dynamic_filter_never_reaches_the_unused_handler(self) -> None:
@@ -604,7 +607,9 @@ def _make_multi_buffer(**overrides) -> DefaultMultiDataBuffer:
             **overrides,
         )
     )
-    return DefaultMultiDataBuffer(DataBufferConstructorInput(args=args, unused_handler_fn=_ignore_group))
+    return DefaultMultiDataBuffer(
+        DataBufferConstructorInput(args=args, resampling_policy=RecordingPolicy(_ignore_group))
+    )
 
 
 def _make_policy_group(group_index: int, *trainer_model_ids: str) -> list[Sample]:
@@ -651,7 +656,7 @@ class TestCheckpointQueueOrder:
         """Restoring a queue preserves every accepted group in its original order."""
         args = _make_args()
         args.rollout_batch_size = 2
-        constructor = DataBufferConstructorInput(args=args, unused_handler_fn=_ignore_group)
+        constructor = DataBufferConstructorInput(args=args, resampling_policy=RecordingPolicy(_ignore_group))
         buffer = fully_async_data_buffer.DefaultDataBuffer(constructor)
         groups = [[_make_sample(index=index, reward=1.0, trainer_model_id="solver")] for index in (8, 3)]
         for group in groups:
@@ -667,7 +672,9 @@ class TestCheckpointQueueOrder:
 
     def test_multi_policy_buffers_skip_their_state_with_a_warning(self, caplog) -> None:
         """Multi-policy rollout state is skipped with a warning instead of blocking the checkpoint."""
-        buffer = DefaultMultiDataBuffer(DataBufferConstructorInput(args=_make_args(), unused_handler_fn=_ignore_group))
+        buffer = DefaultMultiDataBuffer(
+            DataBufferConstructorInput(args=_make_args(), resampling_policy=RecordingPolicy(_ignore_group))
+        )
 
         with caplog.at_level(logging.WARNING, logger="miles.rollout.fully_async_data_buffer"):
             assert buffer.state_dict() == []
@@ -699,15 +706,17 @@ def _with_store_refs(group: list[Sample]) -> list[Sample]:
 
 def _recycling_buffer(**overrides) -> _BufferUnderTest:
     """A buffer whose handler resets the prompt group, as the retry policy does."""
-    unused: list[tuple[list[Sample], UnusedReason]] = []
+    unused: list[tuple[list[Sample], GroupOutcome]] = []
 
-    def recycle(prompt_group: list[Sample], reason: UnusedReason) -> None:
+    def recycle(prompt_group: list[Sample], reason: GroupOutcome) -> None:
         for sample in prompt_group:
             sample.reset_for_retry()
         unused.append((prompt_group, reason))
 
     buffer = DefaultDataBuffer(
-        DataBufferConstructorInput(args=_make_single_policy_args(**overrides), unused_handler_fn=recycle)
+        DataBufferConstructorInput(
+            args=_make_single_policy_args(**overrides), resampling_policy=RecordingPolicy(recycle)
+        )
     )
     return _BufferUnderTest(buffer=buffer, unused=unused)
 
@@ -753,7 +762,7 @@ class TestDroppedGroupsHandOverTheirOutputStoreRefs:
             ]
         )
 
-        assert under_test.unused == [(restored, UnusedReason.RESTORED)]
+        assert under_test.unused == [(restored, GroupOutcome.RESTORED)]
         assert [entry.group for entry in under_test.buffer.state_dict()] == [inline]
         assert sorted(take_dropped_refs()) == ["key-10", "key-11"]
 
@@ -767,5 +776,5 @@ class TestDroppedGroupsHandOverTheirOutputStoreRefs:
 
         under_test.buffer.load_state_dict([DataBufferInput(prompt_group=inline, group=inline)])
 
-        assert under_test.unused == ([(inline, UnusedReason.RESTORED)] if use_output_store else [])
+        assert under_test.unused == ([(inline, GroupOutcome.RESTORED)] if use_output_store else [])
         assert [entry.group for entry in under_test.buffer.state_dict()] == ([] if use_output_store else [inline])

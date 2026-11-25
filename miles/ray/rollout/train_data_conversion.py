@@ -4,6 +4,7 @@ from typing import Any
 import torch
 
 from miles.rollout.generate_utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_sample
+from miles.rollout.resampling import baseline_rewards_and_std
 from miles.rollout.reward_shaping import (
     apply_length_penalty,
     is_correct_reward,
@@ -351,6 +352,11 @@ def _normalize_rewards_by_rollout(
             shared_rewards.append(sibling_rewards[0])
 
         rollout_rewards = torch.tensor(shared_rewards, dtype=torch.float)
+        rollout_std = rollout_rewards.std() if len(rollout_rewards) > 1 else torch.tensor(0.0)
+        # A resampling policy may stamp a baseline over rewards outside the group (never_give_up stamps
+        # every attempt at the prompt); an unstamped group is left as is.
+        group_samples = [samples[sibling_rows[0]] for sibling_rows in rollout_segment_groups]
+        rollout_rewards, rollout_std = baseline_rewards_and_std(group_samples, rollout_rewards, rollout_std)
         normalized_rollout_rewards = rollout_rewards - rollout_rewards.mean()
         # In all-correct groups the only signal is length. Standardizing it would
         # amplify arbitrarily small penalties into full-strength advantages.
@@ -363,7 +369,6 @@ def _normalize_rewards_by_rollout(
             and len(rollout_rewards) > 1
             and not length_only
         ):
-            rollout_std = rollout_rewards.std()
             if rollout_std > 0:
                 normalized_rollout_rewards = normalized_rollout_rewards / (rollout_std + 1e-6)
 

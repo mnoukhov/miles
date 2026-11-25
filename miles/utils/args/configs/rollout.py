@@ -146,13 +146,16 @@ class RolloutRelatedConfig(BaseConfig):
     async_unused_samples_handler: A[
         str,
         Arg(
-            choices=["retry", "drop"],
+            choices=["retry", "drop", "never_give_up"],
             help=(
                 "What to do with a finished group fully async mode does not train on "
                 "(aborted, or beyond --max-weight-staleness): drop "
                 "(default) discards the group; retry recycles its prompts into the data "
                 "source for regeneration. Groups rejected by "
-                "--dynamic-sampling-filter-path are always dropped."
+                "--dynamic-sampling-filter-path are dropped, except by never_give_up (Never Give Up), which "
+                "keeps retrying an unsolved prompt and merges its earlier attempts into the group that finally "
+                "trains (see --ngu-max-budget). never_give_up requires --dynamic-sampling-filter-path "
+                "and --use-dynamic-global-batch-size."
             ),
         ),
     ] = "drop"
@@ -502,6 +505,23 @@ class RolloutRelatedRolloutOnlyConfig(BaseConfig):
             )
         ),
     ] = None
+    ngu_max_budget: A[
+        int | None,
+        Arg(
+            help=(
+                "With --async-unused-samples-handler never_give_up: maximum attempts per unsolved prompt, as a "
+                "multiple of --n-samples-per-prompt (4 allows up to 4 * n_samples_per_prompt samples). A rejected "
+                "prompt is requeued until it has had this many attempts; unset retries until it is solved, and 1 "
+                "never retries. Earlier attempts are buffered until the filter keeps one; then the attempts at "
+                "most --max-weight-staleness versions old train together as one group, with the mean reward over "
+                "the whole chain of attempts as the baseline."
+            )
+        ),
+    ] = None
+    ngu_solved_reward: A[
+        float,
+        Arg(help="Reward at which a prompt counts as solved; never_give_up never requeues a solved prompt."),
+    ] = 1.0
     rollout_submission_granularity: A[
         str | None,
         Arg(
