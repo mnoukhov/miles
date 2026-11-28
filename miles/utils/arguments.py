@@ -2112,6 +2112,23 @@ def _validate_never_give_up_args(args) -> None:
         args.custom_async_data_buffer_path is None
     ), "never_give_up hooks into the default fully async data buffer; drop --custom-async-data-buffer-path"
     assert not args.partial_rollout, "never_give_up does not support --partial-rollout"
+    if args.ngu_budget_unit == "tokens":
+        per_round = args.ngu_response_len_per_round
+        assert per_round is not None and 1 <= per_round < args.rollout_max_response_len, (
+            "--ngu-budget-unit tokens needs --ngu-response-len-per-round in [1, --rollout-max-response-len), got "
+            f"{per_round} with --rollout-max-response-len {args.rollout_max_response_len}"
+        )
+        assert args.ngu_max_budget is None, "--ngu-max-budget counts attempts; --ngu-budget-unit tokens makes none"
+        assert args.custom_generate_function_path is None, (
+            "--ngu-budget-unit tokens resumes cut-off responses with the default single-turn generate function"
+        )
+        # Continued responses stay in their group, so every group keeps n_samples_per_prompt samples.
+        assert not args.use_output_store, "never_give_up does not support --use-output-store"
+        assert not args.enable_sample_ownership_checker, (
+            "never_give_up does not support --enable-sample-ownership-checker"
+        )
+        return
+    assert args.ngu_response_len_per_round is None, "--ngu-response-len-per-round needs --ngu-budget-unit tokens"
     # A merged group holds several attempts at its prompt, so the samples per rollout vary.
     assert args.use_dynamic_global_batch_size, (
         "never_give_up merges retried attempts into the group that trains, so a rollout's sample count varies; "
