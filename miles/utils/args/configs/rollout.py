@@ -154,8 +154,9 @@ class RolloutRelatedConfig(BaseConfig):
                 "source for regeneration. Groups rejected by "
                 "--dynamic-sampling-filter-path are dropped, except by never_give_up (Never Give Up), which "
                 "keeps retrying an unsolved prompt and merges its earlier attempts into the group that finally "
-                "trains (see --ngu-max-budget). never_give_up requires --dynamic-sampling-filter-path "
-                "and --use-dynamic-global-batch-size."
+                "trains (see --ngu-max-budget), or with --ngu-budget-unit tokens continues its cut-off responses "
+                "instead. never_give_up requires --dynamic-sampling-filter-path, and with sample budgets "
+                "--use-dynamic-global-batch-size."
             ),
         ),
     ] = "drop"
@@ -522,6 +523,28 @@ class RolloutRelatedRolloutOnlyConfig(BaseConfig):
         float,
         Arg(help="Reward at which a prompt counts as solved; never_give_up never requeues a solved prompt."),
     ] = 1.0
+    ngu_budget_unit: A[
+        str,
+        Arg(
+            choices=["samples", "tokens"],
+            help=(
+                "What never_give_up spends its budget on. samples (default): another attempt of "
+                "--n-samples-per-prompt fresh responses, up to --ngu-max-budget attempts. tokens: no new attempts; "
+                "the responses of an unsolved group that ran out of tokens continue where they stopped, "
+                "--ngu-response-len-per-round more tokens at a time, up to --rollout-max-response-len tokens each. "
+                "A group's first round stops each response at --ngu-response-len-per-round tokens."
+            )
+        ),
+    ] = "samples"
+    ngu_response_len_per_round: A[
+        int | None,
+        Arg(
+            help=(
+                "With --ngu-budget-unit tokens: response tokens each round gives a response, so its first round "
+                "stops at this length and every continuation adds this many more, up to --rollout-max-response-len."
+            )
+        ),
+    ] = None
     rollout_submission_granularity: A[
         str | None,
         Arg(

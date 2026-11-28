@@ -25,6 +25,8 @@ def _args(**overrides) -> Namespace:
         async_unused_samples_handler="never_give_up",
         ngu_max_budget=None,
         ngu_solved_reward=1.0,
+        ngu_budget_unit="samples",
+        ngu_response_len_per_round=None,
         async_data_buffer_capacity_factor=1000.0,
         async_data_buffer_selection="fifo",
         async_submit_within_staleness=False,
@@ -434,6 +436,7 @@ class TestFullyAsyncRolloutWithNeverGiveUp:
             dynamic_sampling_filter_path=f"{__name__}.nonzero_std",
             ngu_max_budget=None,
             ngu_solved_reward=1.0,
+            ngu_budget_unit="samples",
             async_max_concurrent_samples=2,  # one group in flight, so the retry is the next submission
         )
         attempts = []
@@ -464,6 +467,8 @@ class TestValidateNeverGiveUpArgs:
         defaults = dict(
             async_unused_samples_handler="never_give_up",
             ngu_max_budget=None,
+            ngu_budget_unit="samples",
+            ngu_response_len_per_round=None,
             dynamic_sampling_filter_path="miles.rollout.filter_hub.common_filters.apply_reward_nonzero_std_filter",
             fully_async=True,
             partial_rollout=False,

@@ -10,6 +10,8 @@ trains:
 - ``never_give_up`` (:class:`~miles.rollout.never_give_up.NeverGiveUp`): a round the dynamic
   sampling filter would discard because every response is wrong is retried sequentially, and
   the group that finally trains merges all of its attempts together.
+  With ``--ngu-budget-unit tokens`` (:class:`~miles.rollout.never_give_up_tokens.TokenNeverGiveUp`)
+  the budget is response tokens instead: such a round's cut-off responses continue where they stopped.
 """
 
 from __future__ import annotations
@@ -50,6 +52,9 @@ REWARD_BASELINE_KEY = "reward_baseline"
 
 class ResamplingPolicy:
     """Told the outcome of every finished group; decides what happens to its prompt next."""
+
+    def prepare_group(self, group: list[Sample]) -> None:
+        """Called on every prompt group right before it is submitted for generation; may edit it in place."""
 
     def __call__(self, entry: DataBufferInput, outcome: GroupOutcome) -> None:
         raise NotImplementedError
@@ -128,6 +133,10 @@ def make_resampling_policy(
     if name == "retry":
         return ResampleOnFailure(requeue=requeue)
     assert name == "never_give_up", f"unknown --async-unused-samples-handler {name!r}"
+    if args.ngu_budget_unit == "tokens":
+        from miles.rollout.never_give_up_tokens import TokenNeverGiveUp
+
+        return TokenNeverGiveUp(args, admission_changed=admission_changed, requeue=requeue)
     # Imported here: NeverGiveUp subclasses NoResampling from this module.
     from miles.rollout.never_give_up import NeverGiveUp
 

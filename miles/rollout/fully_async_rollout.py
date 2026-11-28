@@ -160,6 +160,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         stamp_kv_cache_namespace(samples, namespace=self._curr_kv_cache_namespace)
         self._scheduler.on_submit(samples)
         [prompt_group] = samples
+        self._resampling_policy.prepare_group(prompt_group)
         task = asyncio.create_task(self._generate_group(prompt_group))
         self._running_tasks.append(_RunningTask(prompt_group=prompt_group, task=task))
         return task
